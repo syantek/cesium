@@ -42,7 +42,7 @@ define([
                 console.log(errorString);
                 printedBingWarning = true;
             }
-            return 'AnjT_wAj_juA_MsD8NhcEAVSjCYpV-e50lUypkWm1JPxVu0XyVqabsvD3r2DQpX-';
+            return 'AudaMP3YocqmIOQrFAValZ9d_tFqS4JWwiSEnvt2jwP5lizGzV_mJxLaKaI0fWRT';
         }
 
         return BingMapsApi.defaultKey;

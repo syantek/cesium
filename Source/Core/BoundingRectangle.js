@@ -2,18 +2,18 @@
 define([
         './Cartesian2',
         './Cartographic',
+        './Check',
         './defaultValue',
         './defined',
-        './DeveloperError',
         './GeographicProjection',
         './Intersect',
         './Rectangle'
     ], function(
         Cartesian2,
         Cartographic,
+        Check,
         defaultValue,
         defined,
-        DeveloperError,
         GeographicProjection,
         Intersect,
         Rectangle) {
@@ -74,15 +74,13 @@ define([
      * @param {BoundingRectangle} value The value to pack.
      * @param {Number[]} array The array to pack into.
      * @param {Number} [startingIndex=0] The index into the array at which to start packing the elements.
+     *
+     * @returns {Number[]} The array that was packed into
      */
     BoundingRectangle.pack = function(value, array, startingIndex) {
         //>>includeStart('debug', pragmas.debug);
-        if (!defined(value)) {
-            throw new DeveloperError('value is required');
-        }
-        if (!defined(array)) {
-            throw new DeveloperError('array is required');
-        }
+        Check.typeOf.object('value', value);
+        Check.defined('array', array);
         //>>includeEnd('debug');
 
         startingIndex = defaultValue(startingIndex, 0);
@@ -91,6 +89,8 @@ define([
         array[startingIndex++] = value.y;
         array[startingIndex++] = value.width;
         array[startingIndex] = value.height;
+
+        return array;
     };
 
     /**
@@ -103,9 +103,7 @@ define([
      */
     BoundingRectangle.unpack = function(array, startingIndex, result) {
         //>>includeStart('debug', pragmas.debug);
-        if (!defined(array)) {
-            throw new DeveloperError('array is required');
-        }
+        Check.defined('array', array);
         //>>includeEnd('debug');
 
         startingIndex = defaultValue(startingIndex, 0);
@@ -238,12 +236,8 @@ define([
      */
     BoundingRectangle.union = function(left, right, result) {
         //>>includeStart('debug', pragmas.debug);
-        if (!defined(left)) {
-            throw new DeveloperError('left is required.');
-        }
-        if (!defined(right)) {
-            throw new DeveloperError('right is required.');
-        }
+        Check.typeOf.object('left', left);
+        Check.typeOf.object('right', right);
         //>>includeEnd('debug');
 
         if (!defined(result)) {
@@ -272,12 +266,8 @@ define([
      */
     BoundingRectangle.expand = function(rectangle, point, result) {
         //>>includeStart('debug', pragmas.debug);
-        if (!defined(rectangle)) {
-            throw new DeveloperError('rectangle is required.');
-        }
-        if (!defined(point)) {
-            throw new DeveloperError('point is required.');
-        }
+        Check.typeOf.object('rectangle', rectangle);
+        Check.typeOf.object('point', point);
         //>>includeEnd('debug');
 
         result = BoundingRectangle.clone(rectangle, result);
@@ -311,12 +301,8 @@ define([
      */
     BoundingRectangle.intersect = function(left, right) {
         //>>includeStart('debug', pragmas.debug);
-        if (!defined(left)) {
-            throw new DeveloperError('left is required.');
-        }
-        if (!defined(right)) {
-            throw new DeveloperError('right is required.');
-        }
+        Check.typeOf.object('left', left);
+        Check.typeOf.object('right', right);
         //>>includeEnd('debug');
 
         var leftX = left.x;

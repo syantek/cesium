@@ -43,7 +43,7 @@ define([
      */
     function Cesium3DTileFeature(tileset, content, batchId) {
         this._content = content;
-        this._batchTableResources = content.batchTableResources;
+        this._batchTable = content.batchTable;
         this._batchId = batchId;
         this._color = undefined;  // for calling getColor
 
@@ -69,10 +69,10 @@ define([
          */
         show : {
             get : function() {
-                return this._batchTableResources.getShow(this._batchId);
+                return this._batchTable.getShow(this._batchId);
             },
             set : function(value) {
-                this._batchTableResources.setShow(this._batchId, value);
+                this._batchTable.setShow(this._batchId, value);
             }
         },
 
@@ -95,13 +95,44 @@ define([
                 if (!this._color) {
                     this._color = new Color();
                 }
-                return this._batchTableResources.getColor(this._batchId, this._color);
+                return this._batchTable.getColor(this._batchId, this._color);
             },
             set : function(value) {
-                this._batchTableResources.setColor(this._batchId, value);
+                this._batchTable.setColor(this._batchId, value);
             }
         }
     });
+
+    /**
+     * Returns whether the feature contains this property. This includes properties from this feature's
+     * class and inherited classes, in addition to the standard batch table properties.
+     * <p>
+     * {@link Cesium3DTileFeature#show} and {@link Cesium3DTileFeature#color} are not equivalent to
+     * <code>'show'</code> and <code>'color'</code> properties; the former are runtime-specific properties
+     * that are not part of the feature's properties in the stored 3D Tileset.
+     * </p>
+     *
+     * @param {String} name The case-sensitive name of the property.
+     * @returns {Boolean} Whether the feature contains this property.
+     */
+    Cesium3DTileFeature.prototype.hasProperty = function(name) {
+        return this._batchTable.hasProperty(this._batchId, name);
+    };
+
+    /**
+     * Returns an array of property names for the feature. This includes properties from this feature's
+     * class and inherited classes, in addition to the standard batch table properties.
+     * <p>
+     * {@link Cesium3DTileFeature#show} and {@link Cesium3DTileFeature#color} are not equivalent to
+     * <code>'show'</code> and <code>'color'</code> properties; the former are runtime-specific properties
+     * that are not part of the feature's properties in the stored 3D Tileset.
+     * </p>
+     *
+     * @returns {String[]} The names of the feature's properties.
+     */
+    Cesium3DTileFeature.prototype.getPropertyNames = function() {
+        return this._batchTable.getPropertyNames(this._batchId);
+    };
 
     /**
      * Returns the value of the feature's property with the given name.
@@ -112,7 +143,7 @@ define([
      * </p>
      *
      * @param {String} name The case-sensitive name of the property.
-     * @returns {Any} The value of the property or <code>undefined</code> if the property does not exist.
+     * @returns {*} The value of the property or <code>undefined</code> if the property does not exist.
      *
      * @example
      * // Display all the properties for a feature in the console log.
@@ -128,7 +159,7 @@ define([
      * @see {Cesium3DTileset#properties}
      */
     Cesium3DTileFeature.prototype.getProperty = function(name) {
-        return this._batchTableResources.getProperty(this._batchId, name);
+        return this._batchTable.getProperty(this._batchId, name);
     };
 
     /**
@@ -143,7 +174,7 @@ define([
      * </p>
      *
      * @param {String} name The case-sensitive name of the property.
-     * @param {Any} value The value of the property that will be copied.
+     * @param {*} value The value of the property that will be copied.
      *
      * @example
      * var height = feature.getProperty('Height'); // e.g., the height of a building
@@ -160,12 +191,57 @@ define([
      * @see {Cesium3DTileset#properties}
      */
     Cesium3DTileFeature.prototype.setProperty = function(name, value) {
-        this._batchTableResources.setProperty(this._batchId, name, value);
+        this._batchTable.setProperty(this._batchId, name, value);
 
         // PERFORMANCE_IDEA: Probably overkill, but maybe only mark the tile dirty if the
         // property is in one of the style's expressions or - if it can be done quickly -
         // if the new property value changed the result of an expression.
         this._content.featurePropertiesDirty = true;
+    };
+
+    /**
+     * Returns whether the feature's class name equals <code>className</code>. Unlike {@link Cesium3DTileFeature#isClass}
+     * this function only checks the feature's exact class and not inherited classes.
+     * <p>
+     * This function returns <code>false</code> if no batch table hierarchy is present.
+     * </p>
+     *
+     * @param {String} className The name to check against.
+     * @returns {Boolean} Whether the feature's class name equals <code>className</code>
+     *
+     * @private
+     */
+    Cesium3DTileFeature.prototype.isExactClass = function(className) {
+        return this._batchTable.isExactClass(this._batchId, className);
+    };
+
+    /**
+     * Returns whether the feature's class or any inherited classes are named <code>className</code>.
+     * <p>
+     * This function returns <code>false</code> if no batch table hierarchy is present.
+     * </p>
+     *
+     * @param {String} className The name to check against.
+     * @returns {Boolean} Whether the feature's class or inherited classes are named <code>className</code>
+     *
+     * @private
+     */
+    Cesium3DTileFeature.prototype.isClass = function(className) {
+        return this._batchTable.isClass(this._batchId, className);
+    };
+
+    /**
+     * Returns the feature's class name.
+     * <p>
+     * This function returns <code>undefined</code> if no batch table hierarchy is present.
+     * </p>
+     *
+     * @returns {String} The feature's class name.
+     *
+     * @private
+     */
+    Cesium3DTileFeature.prototype.getExactClassName = function() {
+        return this._batchTable.getExactClassName(this._batchId);
     };
 
     return Cesium3DTileFeature;

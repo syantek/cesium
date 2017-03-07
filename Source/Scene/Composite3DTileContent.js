@@ -2,8 +2,8 @@
 define([
         '../Core/defaultValue',
         '../Core/defined',
-        '../Core/destroyObject',
         '../Core/defineProperties',
+        '../Core/destroyObject',
         '../Core/DeveloperError',
         '../Core/getMagic',
         '../Core/loadArrayBuffer',
@@ -15,8 +15,8 @@ define([
     ], function(
         defaultValue,
         defined,
-        destroyObject,
         defineProperties,
+        destroyObject,
         DeveloperError,
         getMagic,
         loadArrayBuffer,
@@ -48,9 +48,10 @@ define([
          * The following properties are part of the {@link Cesium3DTileContent} interface.
          */
         this.state = Cesium3DTileContentState.UNLOADED;
-        this.contentReadyToProcessPromise = when.defer();
-        this.readyPromise = when.defer();
-        this.batchTableResources = undefined;
+        this.batchTable = undefined;
+
+        this._contentReadyToProcessPromise = when.defer();
+        this._readyPromise = when.defer();
     }
 
     defineProperties(Composite3DTileContent.prototype, {
@@ -89,12 +90,40 @@ define([
         },
 
         /**
+         * Part of the {@link Cesium3DTileContent} interface.  <code>Composite3DTileContent</code>
+         * always returns <code>0</code>.  Instead call <code>pointsLength</code> for a tile in the composite.
+         */
+        pointsLength : {
+            get : function() {
+                return 0;
+            }
+        },
+
+        /**
          * Gets the array of {@link Cesium3DTileContent} objects that represent the
          * content of the composite's inner tiles, which can also be composites.
          */
         innerContents : {
             get : function() {
                 return this._contents;
+            }
+        },
+
+        /**
+         * Part of the {@link Cesium3DTileContent} interface.
+         */
+        contentReadyToProcessPromise : {
+            get : function() {
+                return this._contentReadyToProcessPromise.promise;
+            }
+        },
+
+        /**
+         * Part of the {@link Cesium3DTileContent} interface.
+         */
+        readyPromise : {
+            get : function() {
+                return this._readyPromise.promise;
             }
         }
     });
@@ -103,7 +132,7 @@ define([
      * Part of the {@link Cesium3DTileContent} interface.  <code>Composite3DTileContent</code>
      * always returns <code>false</code>.  Instead call <code>hasProperty</code> for a tile in the composite.
      */
-    Composite3DTileContent.prototype.hasProperty = function(name) {
+    Composite3DTileContent.prototype.hasProperty = function(batchId, name) {
         return false;
     };
 
@@ -131,18 +160,22 @@ define([
             type : RequestType.TILES3D,
             distance : distance
         }));
-        if (defined(promise)) {
-            this.state = Cesium3DTileContentState.LOADING;
-            promise.then(function(arrayBuffer) {
-                if (that.isDestroyed()) {
-                    return when.reject('tileset is destroyed');
-                }
-                that.initialize(arrayBuffer);
-            }).otherwise(function(error) {
-                that.state = Cesium3DTileContentState.FAILED;
-                that.readyPromise.reject(error);
-            });
+
+        if (!defined(promise)) {
+            return false;
         }
+
+        this.state = Cesium3DTileContentState.LOADING;
+        promise.then(function(arrayBuffer) {
+            if (that.isDestroyed()) {
+                return when.reject('tileset is destroyed');
+            }
+            that.initialize(arrayBuffer);
+        }).otherwise(function(error) {
+            that.state = Cesium3DTileContentState.FAILED;
+            that._readyPromise.reject(error);
+        });
+        return true;
     };
 
     /**
@@ -179,7 +212,7 @@ define([
         byteOffset += sizeOfUint32;
 
         this.state = Cesium3DTileContentState.PROCESSING;
-        this.contentReadyToProcessPromise.resolve(this);
+        this._contentReadyToProcessPromise.resolve(this);
 
         var contentPromises = [];
 
@@ -205,12 +238,12 @@ define([
 
         var that = this;
 
-        when.all(contentPromises, function() {
+        when.all(contentPromises).then(function() {
             that.state = Cesium3DTileContentState.READY;
-            that.readyPromise.resolve(that);
+            that._readyPromise.resolve(that);
         }).otherwise(function(error) {
             that.state = Cesium3DTileContentState.FAILED;
-            that.readyPromise.reject(error);
+            that._readyPromise.reject(error);
         });
     };
 
@@ -242,6 +275,7 @@ define([
         for (var i = 0; i < length; ++i) {
             contents[i].destroy();
         }
+        content._contents = [];
     }
 
     /**

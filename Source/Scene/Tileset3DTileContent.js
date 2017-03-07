@@ -32,10 +32,11 @@ define([
          * The following properties are part of the {@link Cesium3DTileContent} interface.
          */
         this.state = Cesium3DTileContentState.UNLOADED;
-        this.contentReadyToProcessPromise = when.defer();
-        this.readyPromise = when.defer();
-        this.batchTableResources = undefined;
+        this.batchTable = undefined;
         this.featurePropertiesDirty = false;
+
+        this._contentReadyToProcessPromise = when.defer();
+        this._readyPromise = when.defer();
     }
 
     defineProperties(Tileset3DTileContent.prototype, {
@@ -51,9 +52,36 @@ define([
         /**
          * Part of the {@link Cesium3DTileContent} interface.
          */
+        pointsLength : {
+            get : function() {
+                return 0;
+            }
+        },
+
+        /**
+         * Part of the {@link Cesium3DTileContent} interface.
+         */
         innerContents : {
             get : function() {
                 return undefined;
+            }
+        },
+
+        /**
+         * Part of the {@link Cesium3DTileContent} interface.
+         */
+        contentReadyToProcessPromise : {
+            get : function() {
+                return this._contentReadyToProcessPromise.promise;
+            }
+        },
+
+        /**
+         * Part of the {@link Cesium3DTileContent} interface.
+         */
+        readyPromise : {
+            get : function() {
+                return this._readyPromise.promise;
             }
         }
     });
@@ -62,7 +90,7 @@ define([
      * Part of the {@link Cesium3DTileContent} interface.  <code>Tileset3DTileContent</code>
      * always returns <code>false</code> since a tile of this type does not have any features.
      */
-    Tileset3DTileContent.prototype.hasProperty = function(name) {
+    Tileset3DTileContent.prototype.hasProperty = function(batchId, name) {
         return false;
     };
 
@@ -83,13 +111,14 @@ define([
         this.state = Cesium3DTileContentState.LOADING;
         this._tileset.loadTileset(this._url, this._tile).then(function() {
             that.state = Cesium3DTileContentState.PROCESSING;
-            that.contentReadyToProcessPromise.resolve(that);
+            that._contentReadyToProcessPromise.resolve(that);
             that.state = Cesium3DTileContentState.READY;
-            that.readyPromise.resolve(that);
+            that._readyPromise.resolve(that);
         }).otherwise(function(error) {
             that.state = Cesium3DTileContentState.FAILED;
-            that.readyPromise.reject(error);
+            that._readyPromise.reject(error);
         });
+        return true;
     };
 
     /**
@@ -102,6 +131,13 @@ define([
      * Part of the {@link Cesium3DTileContent} interface.
      */
     Tileset3DTileContent.prototype.applyDebugSettings = function(enabled, color) {
+    };
+
+    /**
+     * Part of the {@link Cesium3DTileContent} interface.
+     */
+    Tileset3DTileContent.prototype.applyStyleWithShader = function(frameState, style) {
+        return false;
     };
 
     /**

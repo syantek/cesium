@@ -218,7 +218,6 @@ define([
      * Checks if there are available slots to make a request, considering the total
      * number of available slots across all servers.
      *
-     * @param {String} [url] The url to check.
      * @returns {Boolean} Returns true if there are available slots, otherwise false.
      */
     RequestScheduler.hasAvailableRequests = function() {
@@ -381,6 +380,22 @@ define([
             console.log('Number of active requests: ' + numberOfActiveRequests);
         }
     }
+
+    /**
+     * Clears the request scheduler before each spec.
+     *
+     * @private
+     */
+    RequestScheduler.clearForSpecs = function() {
+        activeRequestsByServer = {};
+        activeRequests = 0;
+        budgets = [];
+        leftoverRequests = [];
+        deferredRequests = new Queue();
+        stats = {
+            numberOfRequestsThisFrame : 0
+        };
+    };
 
     /**
      * Specifies the maximum number of requests that can be simultaneously open to a single server.  If this value is higher than

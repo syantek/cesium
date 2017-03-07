@@ -5,32 +5,24 @@
   "properties": {
     "id": {
       "minimum": 0,
-      "maximum": 99
+      "maximum": 9
     },
     "Longitude": {
-      "minimum": -1.319700073733107,
-      "maximum": -1.3196596973299783
+      "minimum": -1.3196972173766555,
+      "maximum": -1.3196718547473905
     },
     "Latitude": {
-      "minimum": 0.6988583918578102,
-      "maximum": 0.6988896067140962
+      "minimum": 0.6988624606923348,
+      "maximum": 0.6988888301460953
     },
     "Height": {
-      "minimum": 6,
-      "maximum": 14
-    },
-    "info": {
-      "minimum": null,
-      "maximum": null
-    },
-    "rooms": {
-      "minimum": null,
-      "maximum": null
+      "minimum": 6.2074098233133554,
+      "maximum": 12.83180232718587
     }
   },
   "geometricError": 70,
-  "refine": "add",
   "root": {
+    "refine": "add",
     "boundingVolume": {
       "region": [
         -1.3197004795898053,

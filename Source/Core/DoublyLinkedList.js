@@ -1,8 +1,8 @@
 /*global define*/
 define([
-       '../Core/defined',
-       '../Core/defineProperties',
-       '../Core/DeveloperError'
+        '../Core/defined',
+        '../Core/defineProperties',
+        '../Core/DeveloperError'
     ], function(
         defined,
         defineProperties,
@@ -82,9 +82,11 @@ define([
     };
 
     DoublyLinkedList.prototype.splice = function(node, nextNode) {
+        //>>includeStart('debug', pragmas.debug);
         if (!defined(node) || !defined(nextNode)) {
             throw new DeveloperError('node and nextNode are required.');
         }
+        //>>includeEnd('debug');
 
         if (node === nextNode) {
             return;

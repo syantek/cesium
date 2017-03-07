@@ -2,7 +2,10 @@
 define([
         '../Core/BoundingSphere',
         '../Core/Cartesian3',
+        '../Core/Cartesian4',
+        '../Core/Cartographic',
         '../Core/clone',
+        '../Core/Color',
         '../Core/ComponentDatatype',
         '../Core/defaultValue',
         '../Core/defined',
@@ -10,19 +13,28 @@ define([
         '../Core/destroyObject',
         '../Core/DeveloperError',
         '../Core/Math',
+        '../Core/Matrix3',
         '../Core/Matrix4',
+        '../Core/oneTimeWarning',
         '../Core/PrimitiveType',
+        '../Core/Transforms',
         '../Renderer/Buffer',
         '../Renderer/BufferUsage',
         '../Renderer/DrawCommand',
         '../Renderer/ShaderSource',
         '../ThirdParty/when',
+        './getAttributeOrUniformBySemantic',
         './Model',
-        './SceneMode'
+        './ModelInstance',
+        './SceneMode',
+        './ShadowMode'
     ], function(
         BoundingSphere,
         Cartesian3,
+        Cartesian4,
+        Cartographic,
         clone,
+        Color,
         ComponentDatatype,
         defaultValue,
         defined,
@@ -30,15 +42,21 @@ define([
         destroyObject,
         DeveloperError,
         CesiumMath,
+        Matrix3,
         Matrix4,
+        oneTimeWarning,
         PrimitiveType,
+        Transforms,
         Buffer,
         BufferUsage,
         DrawCommand,
         ShaderSource,
         when,
+        getAttributeOrUniformBySemantic,
         Model,
-        SceneMode) {
+        ModelInstance,
+        SceneMode,
+        ShadowMode) {
     'use strict';
 
     var LoadState = {
@@ -52,19 +70,26 @@ define([
      * A 3D model instance collection. All instances reference the same underlying model, but have unique
      * per-instance properties like model matrix, pick id, etc.
      *
+     * Instances are rendered relative-to-center and for best results instances should be positioned close to one another.
+     * Otherwise there may be precision issues if, for example, instances are placed on opposite sides of the globe.
+     *
      * @alias ModelInstanceCollection
      * @constructor
      *
      * @param {Object} options Object with the following properties:
+     * @param {Object[]} [options.instances] An array of instances, where each instance contains a modelMatrix and optional batchId when options.batchTable is defined.
+     * @param {Cesium3DTileBatchTable} [options.batchTable] The batch table of the instanced 3D Tile.
      * @param {String} [options.url] The url to the .gltf file.
      * @param {Object} [options.headers] HTTP headers to send with the request.
      * @param {Object} [options.requestType] The request type, used for budget scheduling in {@link RequestScheduler}.
      * @param {Object|ArrayBuffer|Uint8Array} [options.gltf] The object for the glTF JSON or an arraybuffer of Binary glTF defined by the CESIUM_binary_glTF extension.
      * @param {String} [options.basePath=''] The base path that paths in the glTF JSON are relative to.
-     * @param {Boolean} [options.dynamic] Collection is set to stream instance data every frame.
+     * @param {Boolean} [options.dynamic=false] Hint if instance model matrices will be updated frequently.
      * @param {Boolean} [options.show=true] Determines if the collection will be shown.
-     * @param {Boolean} [options.allowPicking=false] When <code>true</code>, each glTF mesh and primitive is pickable with {@link Scene#pick}.
+     * @param {Boolean} [options.allowPicking=true] When <code>true</code>, each instance is pickable with {@link Scene#pick}.
      * @param {Boolean} [options.asynchronous=true] Determines if model WebGL resource creation will be spread out over several frames or block until completion once all glTF files are loaded.
+     * @param {Boolean} [options.incrementallyLoadTextures=true] Determine if textures may continue to stream in after the model is loaded.
+     * @param {ShadowMode} [options.shadows=ShadowMode.ENABLED] Determines whether the collection casts or receives shadows from each light source.
      * @param {Boolean} [options.debugShowBoundingVolume=false] For debugging only. Draws the bounding sphere for the collection.
      * @param {Boolean} [options.debugWireframe=false] For debugging only. Draws the instances in wireframe.
      *
@@ -95,30 +120,33 @@ define([
         this._ready = false;
         this._readyPromise = when.defer();
         this._state = LoadState.NEEDS_LOAD;
+        this._dirty = false;
 
-        this._instances = defaultValue(options.instances, []);
+        this._instances = createInstances(this, options.instances);
 
         // When the model instance collection is backed by an instanced 3d-tile,
         // use its batch table resources to modify the shaders, attributes, and uniform maps.
-        this._batchTableResources = options.batchTableResources;
+        this._batchTable = options.batchTable;
 
         this._model = undefined;
-        this._vertexBufferValues = undefined;
+        this._vertexBufferData = undefined; // Hold onto the vertex buffer data when dynamic is true
         this._vertexBuffer = undefined;
-        this._createVertexBuffer = true;
-        this._vertexBufferDirty = false;
+        this._batchIdBuffer = undefined;
         this._instancedUniformsByProgram = undefined;
-
-        // Set to true if nodes in the model have off-center transforms. When false, the vertex shader can be optimized.
-        this._offCenter = undefined;
 
         this._drawCommands = [];
         this._pickCommands = [];
         this._modelCommands = undefined;
 
-        this._boundingVolume = options.boundingVolume;
-        this._boundingVolumeModelView = new Matrix4();
-        this._boundingVolumeExpand = !defined(options.boundingVolume);
+        this._boundingSphere = createBoundingSphere(this);
+        this._center = Cartesian3.clone(this._boundingSphere.center);
+        this._rtcTransform = new Matrix4();
+        this._rtcModelView = new Matrix4(); // Holds onto uniform
+
+        this._mode = undefined;
+
+        this.modelMatrix = Matrix4.clone(Matrix4.IDENTITY);
+        this._modelMatrix = Matrix4.clone(this.modelMatrix);
 
         // Passed on to Model
         this._url = options.url;
@@ -127,6 +155,10 @@ define([
         this._gltf = options.gltf;
         this._basePath = options.basePath;
         this._asynchronous = options.asynchronous;
+        this._incrementallyLoadTextures = options.incrementallyLoadTextures;
+
+        this.shadows = defaultValue(options.shadows, ShadowMode.ENABLED);
+        this._shadows = this.shadows;
 
         this.debugShowBoundingVolume = defaultValue(options.debugShowBoundingVolume, false);
         this._debugShowBoundingVolume = false;
@@ -163,24 +195,36 @@ define([
         }
     });
 
-    // TODO : maybe this whole step should be a pre-process as part of the 3d tile toolchain
-    function isOffCenter(collection) {
-        if (defined(collection._offCenter)) {
-            return collection._offCenter;
+    function createInstances(collection, instancesOptions) {
+        instancesOptions = defaultValue(instancesOptions, []);
+        var length = instancesOptions.length;
+        var instances = new Array(length);
+        for (var i = 0; i < length; ++i) {
+            var instanceOptions = instancesOptions[i];
+            var modelMatrix = instanceOptions.modelMatrix;
+            var instanceId = defaultValue(instanceOptions.batchId, i);
+            instances[i] = new ModelInstance(collection, modelMatrix, instanceId);
+        }
+        return instances;
+    }
+
+    function createBoundingSphere(collection) {
+        var instancesLength = collection.length;
+        var points = new Array(instancesLength);
+        for (var i = 0; i < instancesLength; ++i) {
+            points[i] = Matrix4.getTranslation(collection._instances[i]._modelMatrix, new Cartesian3());
         }
 
-        var nodes = collection._model._runtime.nodes;
-        for (var name in nodes) {
-            if (nodes.hasOwnProperty(name)) {
-                if(!Matrix4.equalsEpsilon(nodes[name].publicNode._matrix, Matrix4.IDENTITY, CesiumMath.EPSILON2)) {
-                    collection._offCenter = true;
-                    return true;
-                }
-            }
-        }
-        collection._offCenter = false;
-        return false;
+        return BoundingSphere.fromPoints(points);
     }
+
+    var scratchCartesian = new Cartesian3();
+    var scratchMatrix = new Matrix4();
+
+    ModelInstanceCollection.prototype.expandBoundingSphere = function(instanceModelMatrix) {
+        var translation = Matrix4.getTranslation(instanceModelMatrix, scratchCartesian);
+        BoundingSphere.expand(this._boundingSphere, translation, this._boundingSphere);
+    };
 
     function getInstancedUniforms(collection, programName) {
         if (defined(collection._instancedUniformsByProgram)) {
@@ -188,9 +232,11 @@ define([
         }
 
         var instancedUniformsByProgram = {};
+        collection._instancedUniformsByProgram = instancedUniformsByProgram;
 
-        var modelSemantics = ['MODEL', 'MODELVIEW', 'MODELVIEWPROJECTION', 'MODELINVERSE', 'MODELVIEWINVERSE', 'MODELVIEWPROJECTIONINVERSE', 'MODELINVERSETRANSPOSE', 'MODELVIEWINVERSETRANSPOSE'];
-        var supportedSemantics = ['MODELVIEW', 'MODELVIEWPROJECTION', 'MODELVIEWINVERSETRANSPOSE'];
+        // When using CESIUM_RTC_MODELVIEW the CESIUM_RTC center is ignored. Instances are always rendered relative-to-center.
+        var modelSemantics = ['MODEL', 'MODELVIEW', 'CESIUM_RTC_MODELVIEW', 'MODELVIEWPROJECTION', 'MODELINVERSE', 'MODELVIEWINVERSE', 'MODELVIEWPROJECTIONINVERSE', 'MODELINVERSETRANSPOSE', 'MODELVIEWINVERSETRANSPOSE'];
+        var supportedSemantics = ['MODELVIEW', 'CESIUM_RTC_MODELVIEW', 'MODELVIEWPROJECTION', 'MODELVIEWINVERSETRANSPOSE'];
 
         var gltf = collection._model.gltf;
         var techniques = gltf.techniques;
@@ -229,7 +275,6 @@ define([
             }
         }
 
-        collection._instancedUniformsByProgram = instancedUniformsByProgram;
         return instancedUniformsByProgram[programName];
     }
 
@@ -238,11 +283,9 @@ define([
     function getVertexShaderCallback(collection) {
         return function(vs, programName) {
             var instancedUniforms = getInstancedUniforms(collection, programName);
-            var dynamic = collection._dynamic;
-            var offCenter = isOffCenter(collection);
-            var regex;
+            var usesBatchTable = defined(collection._batchTable);
 
-            var renamedSource = ShaderSource.replaceMain(vs, 'czm_old_main');
+            var renamedSource = ShaderSource.replaceMain(vs, 'czm_instancing_main');
 
             var globalVarsHeader = '';
             var globalVarsMain = '';
@@ -250,7 +293,7 @@ define([
                 if (instancedUniforms.hasOwnProperty(uniform)) {
                     var semantic = instancedUniforms[uniform];
                     var varName;
-                    if (semantic === 'MODELVIEW') {
+                    if (semantic === 'MODELVIEW' || semantic === 'CESIUM_RTC_MODELVIEW') {
                         varName = 'czm_instanced_modelView';
                     } else if (semantic === 'MODELVIEWPROJECTION') {
                         varName = 'czm_instanced_modelViewProjection';
@@ -263,7 +306,7 @@ define([
                     }
 
                     // Remove the uniform declaration
-                    regex = new RegExp('uniform.*' + uniform + '.*');
+                    var regex = new RegExp('uniform.*' + uniform + '.*');
                     renamedSource = renamedSource.replace(regex, '');
 
                     // Replace all occurrences of the uniform with the global variable
@@ -272,29 +315,13 @@ define([
                 }
             }
 
-            var uniforms = '';
-            if (!dynamic) {
-                uniforms += 'uniform mat4 czm_instanced_collectionModelView;\n';
-            }
-            if (offCenter) {
-                uniforms += 'uniform mat4 czm_instanced_nodeTransform;\n';
-            }
-
-            // When dynamic, czm_instanced_model is the modelView matrix.
-            // Otherwise, czm_instanced_model is the model's local offset from the bounding volume.
+            // czm_instanced_model is the model matrix of the instance relative to center
+            // czm_instanced_modifiedModelView is the transform from the center to view
             // czm_instanced_nodeTransform is the local offset of the node within the model
-            var modelView = '';
-            if (dynamic && offCenter) {
-                modelView = 'czm_instanced_modelView = czm_instanced_model * czm_instanced_nodeTransform;\n';
-            } else if (dynamic && !offCenter) {
-                modelView = 'czm_instanced_modelView = czm_instanced_model;\n';
-            } else if (!dynamic && offCenter) {
-                modelView = 'czm_instanced_modelView = czm_instanced_collectionModelView * czm_instanced_model * czm_instanced_nodeTransform;\n';
-            } else if (!dynamic && !offCenter) {
-                modelView = 'czm_instanced_modelView = czm_instanced_collectionModelView * czm_instanced_model;\n';
-            }
+            var uniforms =
+                'uniform mat4 czm_instanced_modifiedModelView;\n' +
+                'uniform mat4 czm_instanced_nodeTransform;\n';
 
-            var usesBatchTable = defined(collection._batchTableResources);
             var batchIdAttribute = usesBatchTable ? 'attribute float a_batchId;\n' : '';
 
             var instancedSource =
@@ -309,15 +336,15 @@ define([
                 'void main()\n' +
                 '{\n' +
                 '    mat4 czm_instanced_model = mat4(czm_modelMatrixRow0.x, czm_modelMatrixRow1.x, czm_modelMatrixRow2.x, 0.0, czm_modelMatrixRow0.y, czm_modelMatrixRow1.y, czm_modelMatrixRow2.y, 0.0, czm_modelMatrixRow0.z, czm_modelMatrixRow1.z, czm_modelMatrixRow2.z, 0.0, czm_modelMatrixRow0.w, czm_modelMatrixRow1.w, czm_modelMatrixRow2.w, 1.0);\n' +
-                     modelView +
+                '    czm_instanced_modelView = czm_instanced_modifiedModelView * czm_instanced_model * czm_instanced_nodeTransform;\n' +
                      globalVarsMain +
-                '    czm_old_main();\n' +
+                '    czm_instancing_main();\n' +
                 '}';
 
             vertexShaderCached = instancedSource;
 
             if (usesBatchTable) {
-                instancedSource = collection._batchTableResources.getVertexShaderCallback()(instancedSource);
+                instancedSource = collection._batchTable.getVertexShaderCallback(true, 'a_batchId')(instancedSource);
             }
 
             return instancedSource;
@@ -326,8 +353,12 @@ define([
 
     function getFragmentShaderCallback(collection) {
         return function(fs) {
-            if (defined(collection._batchTableResources)) {
-                fs = collection._batchTableResources.getFragmentShaderCallback()(fs);
+            var batchTable = collection._batchTable;
+            if (defined(batchTable)) {
+                var gltf = collection._model.gltf;
+                var diffuseUniformName = getAttributeOrUniformBySemantic(gltf, '_3DTILESDIFFUSE');
+                var colorBlendMode = batchTable._content._tileset.colorBlendMode;
+                fs = batchTable.getFragmentShaderCallback(true, colorBlendMode, diffuseUniformName)(fs);
             }
             return fs;
         };
@@ -337,8 +368,12 @@ define([
         return function (vs) {
             // Use the vertex shader that was generated earlier
             vs = vertexShaderCached;
-            if (defined(collection._batchTableResources)) {
-                vs = collection._batchTableResources.getPickVertexShaderCallback()(vs);
+            var usesBatchTable = defined(collection._batchTable);
+            var allowPicking = collection._allowPicking;
+            if (usesBatchTable) {
+                vs = collection._batchTable.getPickVertexShaderCallback('a_batchId')(vs);
+            } else if (allowPicking) {
+                vs = ShaderSource.createPickVertexShaderSource(vs);
             }
             return vs;
         };
@@ -346,16 +381,20 @@ define([
 
     function getPickFragmentShaderCallback(collection) {
         return function(fs) {
-            if (defined(collection._batchTableResources)) {
-                fs = collection._batchTableResources.getPickFragmentShaderCallback()(fs);
+            var usesBatchTable = defined(collection._batchTable);
+            var allowPicking = collection._allowPicking;
+            if (usesBatchTable) {
+                fs = collection._batchTable.getPickFragmentShaderCallback()(fs);
+            } else if (allowPicking) {
+                fs = ShaderSource.createPickFragmentShaderSource(fs, 'varying');
             }
             return fs;
         };
     }
 
-    function createBoundsModelViewFunction(collection, context) {
+    function createModifiedModelView(collection, context) {
         return function() {
-            return Matrix4.multiplyByTranslation(context.uniformState.view, collection._boundingVolume.center, collection._boundingVolumeModelView);
+            return Matrix4.multiply(context.uniformState.view, collection._rtcTransform, collection._rtcModelView);
         };
     }
 
@@ -368,14 +407,8 @@ define([
     function getUniformMapCallback(collection, context) {
         return function(uniformMap, programName, node) {
             uniformMap = clone(uniformMap);
-
-            if (!collection._dynamic) {
-                uniformMap.czm_instanced_collectionModelView = createBoundsModelViewFunction(collection, context);
-            }
-
-            if (isOffCenter(collection)) {
-                uniformMap.czm_instanced_nodeTransform = createNodeTransformFunction(node);
-            }
+            uniformMap.czm_instanced_modifiedModelView = createModifiedModelView(collection, context);
+            uniformMap.czm_instanced_nodeTransform = createNodeTransformFunction(node);
 
             // Remove instanced uniforms from the uniform map
             var instancedUniforms = getInstancedUniforms(collection, programName);
@@ -385,8 +418,8 @@ define([
                 }
             }
 
-            if (defined(collection._batchTableResources)) {
-                uniformMap = collection._batchTableResources.getUniformMapCallback()(uniformMap);
+            if (defined(collection._batchTable)) {
+                uniformMap = collection._batchTable.getUniformMapCallback()(uniformMap);
             }
 
             return uniformMap;
@@ -396,8 +429,8 @@ define([
     function getPickUniformMapCallback(collection) {
         return function(uniformMap) {
             // Uses the uniform map generated from getUniformMapCallback
-            if (defined(collection._batchTableResources)) {
-                uniformMap = collection._batchTableResources.getPickUniformMapCallback()(uniformMap);
+            if (defined(collection._batchTable)) {
+                uniformMap = collection._batchTable.getPickUniformMapCallback()(uniformMap);
             }
             return uniformMap;
         };
@@ -405,8 +438,8 @@ define([
 
     function getVertexShaderNonInstancedCallback(collection) {
         return function(vs) {
-            if (defined(collection._batchTableResources)) {
-                vs = collection._batchTableResources.getVertexShaderCallback()(vs);
+            if (defined(collection._batchTable)) {
+                vs = collection._batchTable.getVertexShaderCallback(true, 'a_batchId')(vs);
                 // Treat a_batchId as a uniform rather than a vertex attribute
                 vs = 'uniform float a_batchId\n;' + vs;
             }
@@ -416,8 +449,8 @@ define([
 
     function getPickVertexShaderNonInstancedCallback(collection) {
         return function(vs) {
-            if (defined(collection._batchTableResources)) {
-                vs = collection._batchTableResources.getPickVertexShaderCallback()(vs);
+            if (defined(collection._batchTable)) {
+                vs = collection._batchTable.getPickVertexShaderCallback('a_batchId')(vs);
                 // Treat a_batchId as a uniform rather than a vertex attribute
                 vs = 'uniform float a_batchId\n;' + vs;
             }
@@ -425,110 +458,154 @@ define([
         };
     }
 
+    function getPickFragmentShaderNonInstancedCallback(collection) {
+        return function(fs) {
+            var usesBatchTable = defined(collection._batchTable);
+            var allowPicking = collection._allowPicking;
+            if (usesBatchTable) {
+                fs = collection._batchTable.getPickFragmentShaderCallback()(fs);
+            } else if (allowPicking) {
+                fs = ShaderSource.createPickFragmentShaderSource(fs, 'uniform');
+            }
+            return fs;
+        };
+    }
+
     function getUniformMapNonInstancedCallback(collection) {
         return function(uniformMap) {
-            if (defined(collection._batchTableResources)) {
-                uniformMap = collection._batchTableResources.getUniformMapCallback()(uniformMap);
+            if (defined(collection._batchTable)) {
+                uniformMap = collection._batchTable.getUniformMapCallback()(uniformMap);
             }
 
             return uniformMap;
         };
     }
 
-    var instanceMatrix = new Matrix4();
-
-    function updateVertexBuffer(collection, context) {
-        if (!collection._instancingSupported) {
-            return;
-        }
-
-        var instanceBufferData = collection._vertexBufferValues;
-        var vertexBuffer = collection._vertexBuffer;
-        var createVertexBuffer = collection._createVertexBuffer;
-
+    function getVertexBufferData(collection, context) {
+        var instances = collection._instances;
         var instancesLength = collection.length;
-        var dynamic = collection._dynamic;
-        var viewMatrix = context.uniformState.view;
-        var center = dynamic ? Cartesian3.ZERO : collection._boundingVolume.center;
+        var collectionCenter = collection._center;
+        var vertexSizeInFloats = 12;
 
-        // When using a batch table, add a batch id attribute to each vertex
-        var usesBatchTable = defined(collection._batchTableResources);
-        var vertexSizeInFloats = usesBatchTable ? 13 : 12;
-
-        if (createVertexBuffer) {
-            instanceBufferData = new Float32Array(instancesLength * vertexSizeInFloats);
+        var bufferData = collection._vertexBufferData;
+        if (!defined(bufferData)) {
+            bufferData = new Float32Array(instancesLength * vertexSizeInFloats);
+        }
+        if (collection._dynamic) {
+            // Hold onto the buffer data so we don't have to allocate new memory every frame.
+            collection._vertexBufferData = bufferData;
         }
 
         for (var i = 0; i < instancesLength; ++i) {
-            var instance = collection._instances[i];
-            var modelMatrix = instance.modelMatrix;
+            var modelMatrix = instances[i]._modelMatrix;
 
-            if (dynamic) {
-                Matrix4.multiplyTransformation(viewMatrix, modelMatrix, instanceMatrix);
-            } else {
-                instanceMatrix = modelMatrix;
-            }
+            // Instance matrix is relative to center
+            var instanceMatrix = Matrix4.clone(modelMatrix, scratchMatrix);
+            instanceMatrix[12] -= collectionCenter.x;
+            instanceMatrix[13] -= collectionCenter.y;
+            instanceMatrix[14] -= collectionCenter.z;
 
             var offset = i * vertexSizeInFloats;
 
             // First three rows of the model matrix
-            instanceBufferData[offset + 0]  = instanceMatrix[0];
-            instanceBufferData[offset + 1]  = instanceMatrix[4];
-            instanceBufferData[offset + 2]  = instanceMatrix[8];
-            instanceBufferData[offset + 3]  = instanceMatrix[12] - center.x;
-            instanceBufferData[offset + 4]  = instanceMatrix[1];
-            instanceBufferData[offset + 5]  = instanceMatrix[5];
-            instanceBufferData[offset + 6]  = instanceMatrix[9];
-            instanceBufferData[offset + 7]  = instanceMatrix[13] - center.y;
-            instanceBufferData[offset + 8]  = instanceMatrix[2];
-            instanceBufferData[offset + 9]  = instanceMatrix[6];
-            instanceBufferData[offset + 10] = instanceMatrix[10];
-            instanceBufferData[offset + 11] = instanceMatrix[14] - center.z;
-
-            if (usesBatchTable) {
-                instanceBufferData[offset + 12] = instance.batchId;
-            }
+            bufferData[offset + 0]  = instanceMatrix[0];
+            bufferData[offset + 1]  = instanceMatrix[4];
+            bufferData[offset + 2]  = instanceMatrix[8];
+            bufferData[offset + 3]  = instanceMatrix[12];
+            bufferData[offset + 4]  = instanceMatrix[1];
+            bufferData[offset + 5]  = instanceMatrix[5];
+            bufferData[offset + 6]  = instanceMatrix[9];
+            bufferData[offset + 7]  = instanceMatrix[13];
+            bufferData[offset + 8]  = instanceMatrix[2];
+            bufferData[offset + 9]  = instanceMatrix[6];
+            bufferData[offset + 10] = instanceMatrix[10];
+            bufferData[offset + 11] = instanceMatrix[14];
         }
 
-        if (createVertexBuffer) {
-            vertexBuffer = Buffer.createVertexBuffer({
-                context : context,
-                typedArray : instanceBufferData,
-                usage : dynamic ? BufferUsage.STREAM_DRAW : BufferUsage.STATIC_DRAW
-            });
-            collection._vertexBuffer = vertexBuffer;
-            collection._vertexBufferValues = instanceBufferData;
-            collection._createVertexBuffer = false;
-        } else {
-            vertexBuffer.copyFromArrayView(instanceBufferData);
-        }
+        return bufferData;
     }
 
-    function createBoundingVolume(collection) {
-        if (!defined(collection._boundingVolume)) {
-            var instancesLength = collection.length;
-            var points = new Array(instancesLength);
-            for (var i = 0; i < instancesLength; ++i) {
-                points[i] = Matrix4.getTranslation(collection._instances[i].modelMatrix, new Cartesian3());
-            }
+    function createVertexBuffer(collection, context) {
+        var i;
+        var instances = collection._instances;
+        var instancesLength = collection.length;
+        var dynamic = collection._dynamic;
+        var usesBatchTable = defined(collection._batchTable);
+        var allowPicking = collection._allowPicking;
 
-            var boundingSphere = new BoundingSphere();
-            BoundingSphere.fromPoints(points, boundingSphere);
-            collection._boundingVolume = boundingSphere;
+        if (usesBatchTable) {
+            var batchIdBufferData = new Uint16Array(instancesLength);
+            for (i = 0; i < instancesLength; ++i) {
+                batchIdBufferData[i] = instances[i]._instanceId;
+            }
+            collection._batchIdBuffer = Buffer.createVertexBuffer({
+                context : context,
+                typedArray : batchIdBufferData,
+                usage : BufferUsage.STATIC_DRAW
+            });
         }
+
+        if (allowPicking && !usesBatchTable) {
+            var pickIdBuffer = new Uint8Array(instancesLength * 4);
+            for (i = 0; i < instancesLength; ++i) {
+                var pickId = collection._pickIds[i];
+                var pickColor = pickId.color;
+                var offset = i * 4;
+                pickIdBuffer[offset] = Color.floatToByte(pickColor.red);
+                pickIdBuffer[offset + 1] = Color.floatToByte(pickColor.green);
+                pickIdBuffer[offset + 2] = Color.floatToByte(pickColor.blue);
+                pickIdBuffer[offset + 3] = Color.floatToByte(pickColor.alpha);
+            }
+            collection._pickIdBuffer = Buffer.createVertexBuffer({
+                context : context,
+                typedArray : pickIdBuffer,
+                usage : BufferUsage.STATIC_DRAW
+            });
+        }
+
+        var vertexBufferData = getVertexBufferData(collection, context);
+        collection._vertexBuffer = Buffer.createVertexBuffer({
+            context : context,
+            typedArray : vertexBufferData,
+            usage : dynamic ? BufferUsage.STREAM_DRAW : BufferUsage.STATIC_DRAW
+        });
+    }
+
+    function updateVertexBuffer(collection, context) {
+        var vertexBufferData = getVertexBufferData(collection, context);
+        collection._vertexBuffer.copyFromArrayView(vertexBufferData);
+    }
+
+    function createPickIds(collection, context) {
+        // PERFORMANCE_IDEA: we could skip the pick buffer completely by allocating
+        // a continuous range of pickIds and then converting the base pickId + batchId
+        // to RGBA in the shader.  The only consider is precision issues, which might
+        // not be an issue in WebGL 2.
+        var instances = collection._instances;
+        var instancesLength = instances.length;
+        var pickIds = new Array(instancesLength);
+        for (var i = 0; i < instancesLength; ++i) {
+            pickIds[i] = context.createPickId(instances[i]);
+        }
+        return pickIds;
     }
 
     function createModel(collection, context) {
         var instancingSupported = collection._instancingSupported;
+        var usesBatchTable = defined(collection._batchTable);
+        var allowPicking = collection._allowPicking;
+
         var modelOptions = {
             url : collection._url,
             headers : collection._headers,
             requestType : collection._requestType,
             gltf : collection._gltf,
             basePath : collection._basePath,
+            shadows : collection._shadows,
             cacheKey : undefined,
             asynchronous : collection._asynchronous,
-            allowPicking : collection._allowPicking,
+            allowPicking : allowPicking,
+            incrementallyLoadTextures : collection._incrementallyLoadTextures,
             precreatedAttributes : undefined,
             vertexShaderLoaded : undefined,
             fragmentShaderLoaded : undefined,
@@ -539,13 +616,14 @@ define([
             ignoreCommands : true
         };
 
-        createBoundingVolume(collection);
+        if (allowPicking && !usesBatchTable) {
+            collection._pickIds = createPickIds(collection, context);
+        }
 
         if (instancingSupported) {
-            updateVertexBuffer(collection, context);
+            createVertexBuffer(collection, context);
 
-            var usesBatchTable = defined(collection._batchTableResources);
-            var vertexSizeInFloats = usesBatchTable ? 13 : 12;
+            var vertexSizeInFloats = 12;
             var componentSizeInBytes = ComponentDatatype.getSizeInBytes(ComponentDatatype.FLOAT);
 
             var instancedAttributes = {
@@ -585,12 +663,25 @@ define([
             if (usesBatchTable) {
                 instancedAttributes.a_batchId = {
                     index                   : 0, // updated in Model
-                    vertexBuffer            : collection._vertexBuffer,
+                    vertexBuffer            : collection._batchIdBuffer,
                     componentsPerAttribute  : 1,
-                    componentDatatype       : ComponentDatatype.FLOAT,
+                    componentDatatype       : ComponentDatatype.UNSIGNED_SHORT,
                     normalize               : false,
-                    offsetInBytes           : componentSizeInBytes * 12,
-                    strideInBytes           : componentSizeInBytes * vertexSizeInFloats,
+                    offsetInBytes           : 0,
+                    strideInBytes           : 0,
+                    instanceDivisor         : 1
+                };
+            }
+
+            if (allowPicking && !usesBatchTable) {
+                instancedAttributes.pickColor = {
+                    index : 0, // updated in Model
+                    vertexBuffer            : collection._pickIdBuffer,
+                    componentsPerAttribute  : 4,
+                    componentDatatype       : ComponentDatatype.UNSIGNED_BYTE,
+                    normalize               : true,
+                    offsetInBytes           : 0,
+                    strideInBytes           : 0,
                     instanceDivisor         : 1
                 };
             }
@@ -611,7 +702,7 @@ define([
             modelOptions.fragmentShaderLoaded = getFragmentShaderCallback(collection);
             modelOptions.uniformMapLoaded = getUniformMapNonInstancedCallback(collection, context);
             modelOptions.pickVertexShaderLoaded = getPickVertexShaderNonInstancedCallback(collection);
-            modelOptions.pickFragmentShaderLoaded = getPickFragmentShaderCallback(collection);
+            modelOptions.pickFragmentShaderLoaded = getPickFragmentShaderNonInstancedCallback(collection);
             modelOptions.pickUniformMapLoaded = getPickUniformMapCallback(collection);
         }
 
@@ -619,72 +710,6 @@ define([
             collection._model = Model.fromGltf(modelOptions);
         } else {
             collection._model = new Model(modelOptions);
-        }
-    }
-
-    function createBatchIdFunction(batchId) {
-        return function() {
-            return batchId;
-        };
-    }
-
-    function createCommands(collection, drawCommands, pickCommands) {
-        collection._modelCommands = drawCommands;
-
-        var i;
-        var j;
-        var command;
-        var commandsLength = drawCommands.length;
-        var instancesLength = collection.length;
-        var allowPicking = collection.allowPicking;
-        var usesBatchTable = defined(collection._batchTableResources);
-
-        var boundingVolume = collection._boundingVolume;
-
-        if (collection._instancingSupported) {
-            for (i = 0; i < commandsLength; ++i) {
-                command = clone(drawCommands[i]);
-                command.instanceCount = instancesLength;
-                command.boundingVolume = boundingVolume;
-                command.cull = collection._cull;
-                collection._drawCommands.push(command);
-
-                if (allowPicking) {
-                    command = clone(pickCommands[i]);
-                    command.instanceCount = instancesLength;
-                    command.boundingVolume = boundingVolume;
-                    command.cull = collection._cull;
-                    collection._pickCommands.push(command);
-                }
-            }
-        } else {
-            // When instancing is disabled, create commands for every instance.
-            var instances = collection._instances;
-            for (i = 0; i < commandsLength; ++i) {
-                for (j = 0; j < instancesLength; ++j) {
-                    command = clone(drawCommands[i]);
-                    command.modelMatrix = new Matrix4();
-                    command.boundingVolume = new BoundingSphere();
-                    command.cull = collection._cull;
-                    command.uniformMap = clone(command.uniformMap);
-                    if (usesBatchTable) {
-                        command.uniformMap.a_batchId = createBatchIdFunction(instances[j].batchId);
-                    }
-                    collection._drawCommands.push(command);
-
-                    if (allowPicking) {
-                        command = clone(pickCommands[i]);
-                        command.modelMatrix = new Matrix4();
-                        command.boundingVolume = new BoundingSphere();
-                        command.cull = collection._cull;
-                        command.uniformMap = clone(command.uniformMap);
-                        if (usesBatchTable) {
-                            command.uniformMap.a_batchId = createBatchIdFunction(instances[j].batchId);
-                        }
-                        collection._pickCommands.push(command);
-                    }
-                }
-            }
         }
     }
 
@@ -714,26 +739,102 @@ define([
         }
     }
 
-    function updateCommands(collection) {
-        // Only applies when instancing is disabled. The instanced shader handles node transformations.
-        if (collection._instancingSupported) {
-            return;
-        }
+    function createCommands(collection, drawCommands, pickCommands) {
+        var commandsLength = drawCommands.length;
+        var instancesLength = collection.length;
+        var allowPicking = collection.allowPicking;
+        var boundingSphere = collection._boundingSphere;
+        var cull = collection._cull;
 
+        for (var i = 0; i < commandsLength; ++i) {
+            var drawCommand = DrawCommand.shallowClone(drawCommands[i]);
+            drawCommand.instanceCount = instancesLength;
+            drawCommand.boundingVolume = boundingSphere;
+            drawCommand.cull = cull;
+            collection._drawCommands.push(drawCommand);
+
+            if (allowPicking) {
+                var pickCommand = DrawCommand.shallowClone(pickCommands[i]);
+                pickCommand.instanceCount = instancesLength;
+                pickCommand.boundingVolume = boundingSphere;
+                pickCommand.cull = cull;
+                collection._pickCommands.push(pickCommand);
+            }
+        }
+    }
+
+    function createBatchIdFunction(batchId) {
+        return function() {
+            return batchId;
+        };
+    }
+
+    function createPickColorFunction(color) {
+        return function() {
+            return color;
+        };
+    }
+
+    function createCommandsNonInstanced(collection, drawCommands, pickCommands) {
+        // When instancing is disabled, create commands for every instance.
+        var instances = collection._instances;
+        var commandsLength = drawCommands.length;
+        var instancesLength = collection.length;
+        var allowPicking = collection.allowPicking;
+        var usesBatchTable = defined(collection._batchTable);
+        var cull = collection._cull;
+
+        for (var i = 0; i < commandsLength; ++i) {
+            for (var j = 0; j < instancesLength; ++j) {
+                var drawCommand = DrawCommand.shallowClone(drawCommands[i]);
+                drawCommand.modelMatrix = new Matrix4(); // Updated in updateCommandsNonInstanced
+                drawCommand.boundingVolume = new BoundingSphere(); // Updated in updateCommandsNonInstanced
+                drawCommand.cull = cull;
+                drawCommand.uniformMap = clone(drawCommand.uniformMap);
+                if (usesBatchTable) {
+                    drawCommand.uniformMap.a_batchId = createBatchIdFunction(instances[j]._instanceId);
+                }
+                collection._drawCommands.push(drawCommand);
+
+                if (allowPicking) {
+                    var pickCommand = DrawCommand.shallowClone(pickCommands[i]);
+                    pickCommand.modelMatrix = new Matrix4(); // Updated in updateCommandsNonInstanced
+                    pickCommand.boundingVolume = new BoundingSphere(); // Updated in updateCommandsNonInstanced
+                    pickCommand.cull = cull;
+                    pickCommand.uniformMap = clone(pickCommand.uniformMap);
+                    if (usesBatchTable) {
+                        pickCommand.uniformMap.a_batchId = createBatchIdFunction(instances[j]._instanceId);
+                    } else if (allowPicking) {
+                        var pickId = collection._pickIds[j];
+                        pickCommand.uniformMap.czm_pickColor = createPickColorFunction(pickId.color);
+                    }
+                    collection._pickCommands.push(pickCommand);
+                }
+            }
+        }
+    }
+
+    function updateCommandsNonInstanced(collection) {
         var modelCommands = collection._modelCommands;
         var commandsLength = modelCommands.length;
         var instancesLength = collection.length;
         var allowPicking = collection.allowPicking;
+        var collectionTransform = collection._rtcTransform;
+        var collectionCenter = collection._center;
 
         for (var i = 0; i < commandsLength; ++i) {
             var modelCommand = modelCommands[i];
             for (var j = 0; j < instancesLength; ++j) {
                 var commandIndex = i * instancesLength + j;
                 var drawCommand = collection._drawCommands[commandIndex];
-                var instanceMatrix = collection._instances[j].modelMatrix;
+                var instanceMatrix = Matrix4.clone(collection._instances[j]._modelMatrix, scratchMatrix);
+                instanceMatrix[12] -= collectionCenter.x;
+                instanceMatrix[13] -= collectionCenter.y;
+                instanceMatrix[14] -= collectionCenter.z;
+                instanceMatrix = Matrix4.multiply(collectionTransform, instanceMatrix, scratchMatrix);
                 var nodeMatrix = modelCommand.modelMatrix;
                 var modelMatrix = drawCommand.modelMatrix;
-                Matrix4.multiplyTransformation(instanceMatrix, nodeMatrix, modelMatrix);
+                Matrix4.multiply(instanceMatrix, nodeMatrix, modelMatrix);
 
                 var nodeBoundingSphere = modelCommand.boundingVolume;
                 var boundingSphere = drawCommand.boundingVolume;
@@ -769,11 +870,24 @@ define([
         };
     }
 
-    ModelInstanceCollection.prototype.update = function(frameState) {
-        if (frameState.mode !== SceneMode.SCENE3D) {
-            return;
-        }
+    function updateShadows(collection) {
+        if (collection.shadows !== collection._shadows) {
+            collection._shadows = collection.shadows;
 
+            var castShadows = ShadowMode.castShadows(collection.shadows);
+            var receiveShadows = ShadowMode.receiveShadows(collection.shadows);
+
+            var drawCommands = collection._drawCommands;
+            var length = drawCommands.length;
+            for (var i = 0; i < length; ++i) {
+                var drawCommand = drawCommands[i];
+                drawCommand.castShadows = castShadows;
+                drawCommand.receiveShadows = receiveShadows;
+            }
+        }
+    }
+
+    ModelInstanceCollection.prototype.update = function(frameState) {
         if (!this.show) {
             return;
         }
@@ -783,18 +897,19 @@ define([
         }
 
         var context = frameState.context;
-        this._instancingSupported = context.instancedArrays;
 
         if (this._state === LoadState.NEEDS_LOAD) {
             this._state = LoadState.LOADING;
+            this._instancingSupported = context.instancedArrays;
             createModel(this, context);
             var that = this;
-            when(this._model.readyPromise).otherwise(function(error) {
+            this._model.readyPromise.otherwise(function(error) {
                 that._state = LoadState.FAILED;
                 that._readyPromise.reject(error);
             });
         }
 
+        var instancingSupported = this._instancingSupported;
         var model = this._model;
         model.update(frameState);
 
@@ -802,14 +917,19 @@ define([
             this._state = LoadState.LOADED;
             this._ready = true;
 
-            // Expand bounding volume to fit the radius of the loaded model
-            if (this._boundingVolumeExpand) {
-                this._boundingVolume.radius += model.boundingSphere.radius;
-            }
+            // Expand bounding volume to fit the radius of the loaded model including the model's offset from the center
+            var modelRadius = model.boundingSphere.radius + Cartesian3.magnitude(model.boundingSphere.center);
+            this._boundingSphere.radius += modelRadius;
 
             var modelCommands = getModelCommands(model);
-            createCommands(this, modelCommands.draw, modelCommands.pick);
-            updateCommands(this);
+            this._modelCommands = modelCommands.draw;
+
+            if (instancingSupported) {
+                createCommands(this, modelCommands.draw, modelCommands.pick);
+            } else {
+                createCommandsNonInstanced(this, modelCommands.draw, modelCommands.pick);
+                updateCommandsNonInstanced(this);
+            }
 
             this._readyPromise.resolve(this);
             return;
@@ -819,17 +939,37 @@ define([
             return;
         }
 
+        var modeChanged = (frameState.mode !== this._mode);
+        var modelMatrix = this.modelMatrix;
+        var modelMatrixChanged = !Matrix4.equals(this._modelMatrix, modelMatrix);
+
+        if (modeChanged || modelMatrixChanged) {
+            this._mode = frameState.mode;
+            Matrix4.clone(modelMatrix, this._modelMatrix);
+            var rtcTransform = Matrix4.multiplyByTranslation(this._modelMatrix, this._center, this._rtcTransform);
+            if (this._mode !== SceneMode.SCENE3D) {
+                rtcTransform = Transforms.basisTo2D(frameState.mapProjection, rtcTransform, rtcTransform);
+            }
+            Matrix4.getTranslation(rtcTransform, this._boundingSphere.center);
+        }
+
+        if (instancingSupported && this._dirty) {
+            // If at least one instance has moved assume the collection is now dynamic
+            this._dynamic = true;
+            this._dirty = false;
+
+            // PERFORMANCE_IDEA: only update dirty sub-sections instead of the whole collection
+            updateVertexBuffer(this, context);
+        }
+
         // If any node changes due to an animation, update the commands. This could be inefficient if the model is
         // composed of many nodes and only one changes, however it is probably fine in the general use case.
-        if (model.dirty) {
-            updateCommands(this);
+        // Only applies when instancing is disabled. The instanced shader automatically handles node transformations.
+        if (!instancingSupported && (model.dirty || this._dirty || modeChanged || modelMatrixChanged)) {
+            updateCommandsNonInstanced(this);
         }
 
-        if (this._dynamic || this._vertexBufferDirty) {
-            updateVertexBuffer(this, context);
-            this._vertexBufferDirty = false;
-        }
-
+        updateShadows(this);
         updateWireframe(this);
         updateShowBoundingVolume(this);
 
@@ -848,6 +988,15 @@ define([
 
     ModelInstanceCollection.prototype.destroy = function() {
         this._model = this._model && this._model.destroy();
+
+        var pickIds = this._pickIds;
+        if (defined(pickIds)) {
+            var length = pickIds.length;
+            for (var i = 0; i < length; ++i) {
+                pickIds[i].destroy();
+            }
+        }
+
         return destroyObject(this);
     };
 

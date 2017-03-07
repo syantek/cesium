@@ -1,51 +1,69 @@
 /*global define*/
 define([
+        '../Core/AttributeCompression',
+        '../Core/Cartesian2',
         '../Core/Cartesian3',
         '../Core/Color',
+        '../Core/ComponentDatatype',
         '../Core/defaultValue',
         '../Core/defined',
         '../Core/defineProperties',
         '../Core/destroyObject',
         '../Core/DeveloperError',
         '../Core/Ellipsoid',
+        '../Core/getBaseUri',
         '../Core/getMagic',
         '../Core/getStringFromTypedArray',
         '../Core/joinUrls',
         '../Core/loadArrayBuffer',
+        '../Core/Math',
+        '../Core/Matrix3',
         '../Core/Matrix4',
+        '../Core/Quaternion',
         '../Core/Request',
         '../Core/RequestScheduler',
         '../Core/RequestType',
         '../Core/Transforms',
+        '../Core/TranslationRotationScale',
         '../ThirdParty/Uri',
         '../ThirdParty/when',
-        './Cesium3DTileFeature',
-        './Cesium3DTileBatchTableResources',
+        './Cesium3DTileBatchTable',
         './Cesium3DTileContentState',
+        './Cesium3DTileFeature',
+        './Cesium3DTileFeatureTable',
         './ModelInstanceCollection'
     ], function(
+        AttributeCompression,
+        Cartesian2,
         Cartesian3,
         Color,
+        ComponentDatatype,
         defaultValue,
         defined,
         defineProperties,
         destroyObject,
         DeveloperError,
         Ellipsoid,
+        getBaseUri,
         getMagic,
         getStringFromTypedArray,
         joinUrls,
         loadArrayBuffer,
+        CesiumMath,
+        Matrix3,
         Matrix4,
+        Quaternion,
         Request,
         RequestScheduler,
         RequestType,
         Transforms,
+        TranslationRotationScale,
         Uri,
         when,
-        Cesium3DTileFeature,
-        Cesium3DTileBatchTableResources,
+        Cesium3DTileBatchTable,
         Cesium3DTileContentState,
+        Cesium3DTileFeature,
+        Cesium3DTileFeatureTable,
         ModelInstanceCollection) {
     'use strict';
 
@@ -69,11 +87,11 @@ define([
          * The following properties are part of the {@link Cesium3DTileContent} interface.
          */
         this.state = Cesium3DTileContentState.UNLOADED;
-        this.contentReadyToProcessPromise = when.defer();
-        this.readyPromise = when.defer();
-        this.batchTableResources = undefined;
+        this.batchTable = undefined;
         this.featurePropertiesDirty = false;
 
+        this._contentReadyToProcessPromise = when.defer();
+        this._readyPromise = when.defer();
         this._features = undefined;
     }
 
@@ -83,7 +101,20 @@ define([
          */
         featuresLength : {
             get : function() {
-                return this._modelInstanceCollection.length;
+                if (defined(this._modelInstanceCollection)) {
+                    return this._modelInstanceCollection.length;
+                } else {
+                    return 0;
+                }
+            }
+        },
+
+        /**
+         * Part of the {@link Cesium3DTileContent} interface.
+         */
+        pointsLength : {
+            get : function() {
+                return 0;
             }
         },
 
@@ -93,6 +124,24 @@ define([
         innerContents : {
             get : function() {
                 return undefined;
+            }
+        },
+
+        /**
+         * Part of the {@link Cesium3DTileContent} interface.
+         */
+        contentReadyToProcessPromise : {
+            get : function() {
+                return this._contentReadyToProcessPromise.promise;
+            }
+        },
+
+        /**
+         * Part of the {@link Cesium3DTileContent} interface.
+         */
+        readyPromise : {
+            get : function() {
+                return this._readyPromise.promise;
             }
         }
     });
@@ -112,15 +161,15 @@ define([
     /**
      * Part of the {@link Cesium3DTileContent} interface.
      */
-    Instanced3DModel3DTileContent.prototype.hasProperty = function(name) {
-        return this.batchTableResources.hasProperty(name);
+    Instanced3DModel3DTileContent.prototype.hasProperty = function(batchId, name) {
+        return this.batchTable.hasProperty(batchId, name);
     };
 
     /**
      * Part of the {@link Cesium3DTileContent} interface.
      */
     Instanced3DModel3DTileContent.prototype.getFeature = function(batchId) {
-        var featuresLength = this._modelInstanceCollection.length;
+        var featuresLength = this.featuresLength;
         //>>includeStart('debug', pragmas.debug);
         if (!defined(batchId) || (batchId < 0) || (batchId >= featuresLength)) {
             throw new DeveloperError('batchId is required and between zero and featuresLength - 1 (' + (featuresLength - 1) + ').');
@@ -131,16 +180,13 @@ define([
         return this._features[batchId];
     };
 
-    var sizeOfUint16 = Uint16Array.BYTES_PER_ELEMENT;
     var sizeOfUint32 = Uint32Array.BYTES_PER_ELEMENT;
-    var sizeOfFloat64 = Float64Array.BYTES_PER_ELEMENT;
 
     /**
      * Part of the {@link Cesium3DTileContent} interface.
      */
     Instanced3DModel3DTileContent.prototype.request = function() {
         var that = this;
-
         var distance = this._tile.distanceToCamera;
         var promise = RequestScheduler.schedule(new Request({
             url : this._url,
@@ -149,18 +195,22 @@ define([
             type : RequestType.TILES3D,
             distance : distance
         }));
-        if (defined(promise)) {
-            this.state = Cesium3DTileContentState.LOADING;
-            promise.then(function(arrayBuffer) {
-                if (that.isDestroyed()) {
-                    return when.reject('tileset is destroyed');
-                }
-                that.initialize(arrayBuffer);
-            }).otherwise(function(error) {
-                that.state = Cesium3DTileContentState.FAILED;
-                that.readyPromise.reject(error);
-            });
+
+        if (!defined(promise)) {
+            return false;
         }
+
+        this.state = Cesium3DTileContentState.LOADING;
+        promise.then(function(arrayBuffer) {
+            if (that.isDestroyed()) {
+                return when.reject('tileset is destroyed');
+            }
+            that.initialize(arrayBuffer);
+        }).otherwise(function(error) {
+            that.state = Cesium3DTileContentState.FAILED;
+            that._readyPromise.reject(error);
+        });
+        return true;
     };
 
     /**
@@ -170,7 +220,8 @@ define([
         // Destroy expired resources if they exist.
         destroyResources(this);
 
-        byteOffset = defaultValue(byteOffset, 0);
+        var byteStart = defaultValue(byteOffset, 0);
+        byteOffset = byteStart;
 
         var uint8Array = new Uint8Array(arrayBuffer);
         var magic = getMagic(uint8Array, byteOffset);
@@ -181,100 +232,220 @@ define([
         var view = new DataView(arrayBuffer);
         byteOffset += sizeOfUint32;  // Skip magic number
 
-        //>>includeStart('debug', pragmas.debug);
         var version = view.getUint32(byteOffset, true);
+        //>>includeStart('debug', pragmas.debug);
         if (version !== 1) {
             throw new DeveloperError('Only Instanced 3D Model version 1 is supported. Version ' + version + ' is not.');
         }
         //>>includeEnd('debug');
         byteOffset += sizeOfUint32;
 
-        // Skip byteLength
+        var byteLength = view.getUint32(byteOffset, true);
         byteOffset += sizeOfUint32;
 
-        var batchTableByteLength = view.getUint32(byteOffset, true);
+        var featureTableJsonByteLength = view.getUint32(byteOffset, true);
+        //>>includeStart('debug', pragmas.debug);
+        if (featureTableJsonByteLength === 0) {
+            throw new DeveloperError('featureTableJsonByteLength is zero, the feature table must be defined.');
+        }
+        //>>includeEnd('debug');
         byteOffset += sizeOfUint32;
 
-        var gltfByteLength = view.getUint32(byteOffset, true);
+        var featureTableBinaryByteLength = view.getUint32(byteOffset, true);
+        byteOffset += sizeOfUint32;
+
+        var batchTableJsonByteLength = view.getUint32(byteOffset, true);
+        byteOffset += sizeOfUint32;
+
+        var batchTableBinaryByteLength = view.getUint32(byteOffset, true);
         byteOffset += sizeOfUint32;
 
         var gltfFormat = view.getUint32(byteOffset, true);
+        //>>includeStart('debug', pragmas.debug);
+        if (gltfFormat !== 1 && gltfFormat !== 0) {
+            throw new DeveloperError('Only glTF format 0 (uri) or 1 (embedded) are supported. Format ' + gltfFormat + ' is not.');
+        }
+        //>>includeEnd('debug');
         byteOffset += sizeOfUint32;
 
-        var instancesLength = view.getUint32(byteOffset, true);
-        byteOffset += sizeOfUint32;
+        var featureTableString = getStringFromTypedArray(uint8Array, byteOffset, featureTableJsonByteLength);
+        var featureTableJson = JSON.parse(featureTableString);
+        byteOffset += featureTableJsonByteLength;
+
+        var featureTableBinary = new Uint8Array(arrayBuffer, byteOffset, featureTableBinaryByteLength);
+        byteOffset += featureTableBinaryByteLength;
+
+        var featureTable = new Cesium3DTileFeatureTable(featureTableJson, featureTableBinary);
+        var instancesLength = featureTable.getGlobalProperty('INSTANCES_LENGTH', ComponentDatatype.UNSIGNED_INT);
+        featureTable.featuresLength = instancesLength;
 
         //>>includeStart('debug', pragmas.debug);
-        if ((gltfFormat !== 0) && (gltfFormat !== 1)) {
-            throw new DeveloperError('Only glTF format 0 (uri) or 1 (embedded) are supported. Format ' + gltfFormat + ' is not');
+        if (!defined(instancesLength)) {
+            throw new DeveloperError('Feature table global property: INSTANCES_LENGTH must be defined');
         }
         //>>includeEnd('debug');
 
-        var batchTableResources = new Cesium3DTileBatchTableResources(this, instancesLength);
-        this.batchTableResources = batchTableResources;
-        var hasBatchTable = false;
-        if (batchTableByteLength > 0) {
-            hasBatchTable = true;
-            var batchTableString = getStringFromTypedArray(uint8Array, byteOffset, batchTableByteLength);
-            batchTableResources.batchTable = JSON.parse(batchTableString);
-            byteOffset += batchTableByteLength;
+        var batchTableJson;
+        var batchTableBinary;
+        if (batchTableJsonByteLength > 0) {
+            var batchTableString = getStringFromTypedArray(uint8Array, byteOffset, batchTableJsonByteLength);
+            batchTableJson = JSON.parse(batchTableString);
+            byteOffset += batchTableJsonByteLength;
+
+            if (batchTableBinaryByteLength > 0) {
+                // Has a batch table binary
+                batchTableBinary = new Uint8Array(arrayBuffer, byteOffset, batchTableBinaryByteLength);
+                // Copy the batchTableBinary section and let the underlying ArrayBuffer be freed
+                batchTableBinary = new Uint8Array(batchTableBinary);
+                byteOffset += batchTableBinaryByteLength;
+            }
         }
 
+        this.batchTable = new Cesium3DTileBatchTable(this, instancesLength, batchTableJson, batchTableBinary);
+
+        var gltfByteLength = byteStart + byteLength - byteOffset;
+        //>>includeStart('debug', pragmas.debug);
+        if (gltfByteLength === 0) {
+            throw new DeveloperError('glTF byte length is zero, i3dm must have a glTF to instance.');
+        }
+        //>>includeEnd('debug');
         var gltfView = new Uint8Array(arrayBuffer, byteOffset, gltfByteLength);
         byteOffset += gltfByteLength;
-
-        // Each vertex has a longitude, latitude, and optionally batchId if there is a batch table
-        // Coordinates are in double precision, batchId is a short
-        var instanceByteLength = sizeOfFloat64 * 2 + (hasBatchTable ? sizeOfUint16 : 0);
-        var instancesByteLength = instancesLength * instanceByteLength;
-
-        var instancesView = new DataView(arrayBuffer, byteOffset, instancesByteLength);
-        byteOffset += instancesByteLength;
 
         // Create model instance collection
         var collectionOptions = {
             instances : new Array(instancesLength),
-            batchTableResources : batchTableResources,
-            boundingVolume : this._tile.contentBoundingVolume.boundingVolume,
-            cull : false,
+            batchTable : this.batchTable,
+            cull : false, // Already culled by 3D Tiles
             url : undefined,
-            headers : undefined,
-            type : RequestType.TILES3D,
+            requestType : RequestType.TILES3D,
             gltf : undefined,
-            basePath : undefined
+            basePath : undefined,
+            incrementallyLoadTextures : false
         };
 
         if (gltfFormat === 0) {
             var gltfUrl = getStringFromTypedArray(gltfView);
-            collectionOptions.url = joinUrls(this._tileset.baseUrl, gltfUrl);
+            collectionOptions.url = joinUrls(getBaseUri(this._url), gltfUrl);
         } else {
             collectionOptions.gltf = gltfView;
-            collectionOptions.basePath = this._url;
+            collectionOptions.basePath = getBaseUri(this._url);
         }
 
-        var ellipsoid = Ellipsoid.WGS84;
-        var position = new Cartesian3();
+        var eastNorthUp = featureTable.getGlobalProperty('EAST_NORTH_UP');
+
         var instances = collectionOptions.instances;
-        byteOffset = 0;
+        var instancePosition = new Cartesian3();
+        var instancePositionArray = new Array(3);
+        var instanceNormalRight = new Cartesian3();
+        var instanceNormalUp = new Cartesian3();
+        var instanceNormalForward = new Cartesian3();
+        var instanceRotation = new Matrix3();
+        var instanceQuaternion = new Quaternion();
+        var instanceScale = new Cartesian3();
+        var instanceTranslationRotationScale = new TranslationRotationScale();
+        var instanceTransform = new Matrix4();
+        for (var i = 0; i < instancesLength; i++) {
+            // Get the instance position
+            var position = featureTable.getProperty('POSITION', i, ComponentDatatype.FLOAT, 3);
+            if (!defined(position)) {
+                position = instancePositionArray;
+                var positionQuantized = featureTable.getProperty('POSITION_QUANTIZED', i, ComponentDatatype.UNSIGNED_SHORT, 3);
+                //>>includeStart('debug', pragmas.debug);
+                if (!defined(positionQuantized)) {
+                    throw new DeveloperError('Either POSITION or POSITION_QUANTIZED must be defined for each instance.');
+                }
+                //>>includeEnd('debug');
+                var quantizedVolumeOffset = featureTable.getGlobalProperty('QUANTIZED_VOLUME_OFFSET', ComponentDatatype.FLOAT, 3);
+                //>>includeStart('debug', pragmas.debug);
+                if (!defined(quantizedVolumeOffset)) {
+                    throw new DeveloperError('Global property: QUANTIZED_VOLUME_OFFSET must be defined for quantized positions.');
+                }
+                //>>includeEnd('debug');
+                var quantizedVolumeScale = featureTable.getGlobalProperty('QUANTIZED_VOLUME_SCALE', ComponentDatatype.FLOAT, 3);
+                //>>includeStart('debug', pragmas.debug);
+                if (!defined(quantizedVolumeScale)) {
+                    throw new DeveloperError('Global property: QUANTIZED_VOLUME_SCALE must be defined for quantized positions.');
+                }
+                //>>includeEnd('debug');
+                for (var j = 0; j < 3; j++) {
+                    position[j] = (positionQuantized[j] / 65535.0 * quantizedVolumeScale[j]) + quantizedVolumeOffset[j];
+                }
+            }
+            Cartesian3.unpack(position, 0, instancePosition);
+            instanceTranslationRotationScale.translation = instancePosition;
 
-        for (var i = 0; i < instancesLength; ++i) {
-            // Get longitude and latitude
-            var longitude = instancesView.getFloat64(byteOffset, true);
-            byteOffset += sizeOfFloat64;
-            var latitude = instancesView.getFloat64(byteOffset, true);
-            byteOffset += sizeOfFloat64;
-            var height = 0.0;
+            // Get the instance rotation
+            var normalUp = featureTable.getProperty('NORMAL_UP', i, ComponentDatatype.FLOAT, 3);
+            var normalRight = featureTable.getProperty('NORMAL_RIGHT', i, ComponentDatatype.FLOAT, 3);
+            var hasCustomOrientation = false;
+            if (defined(normalUp)) {
+                //>>includeStart('debug', pragmas.debug);
+                if (!defined(normalRight)) {
+                    throw new DeveloperError('To define a custom orientation, both NORMAL_UP and NORMAL_RIGHT must be defined.');
+                }
+                //>>includeEnd('debug');
+                Cartesian3.unpack(normalUp, 0, instanceNormalUp);
+                Cartesian3.unpack(normalRight, 0, instanceNormalRight);
+                hasCustomOrientation = true;
+            } else {
+                var octNormalUp = featureTable.getProperty('NORMAL_UP_OCT32P', i, ComponentDatatype.UNSIGNED_SHORT, 2);
+                var octNormalRight = featureTable.getProperty('NORMAL_RIGHT_OCT32P', i, ComponentDatatype.UNSIGNED_SHORT, 2);
+                if (defined(octNormalUp)) {
+                    //>>includeStart('debug', pragmas.debug);
+                    if (!defined(octNormalRight)) {
+                        throw new DeveloperError('To define a custom orientation with oct-encoded vectors, both NORMAL_UP_OCT32P and NORMAL_RIGHT_OCT32P must be defined.');
+                    }
+                    //>>includeEnd('debug');
+                    AttributeCompression.octDecodeInRange(octNormalUp[0], octNormalUp[1], 65535, instanceNormalUp);
+                    AttributeCompression.octDecodeInRange(octNormalRight[0], octNormalRight[1], 65535, instanceNormalRight);
+                    hasCustomOrientation = true;
+                } else if (eastNorthUp) {
+                    Transforms.eastNorthUpToFixedFrame(instancePosition, Ellipsoid.WGS84, instanceTransform);
+                    Matrix4.getRotation(instanceTransform, instanceRotation);
+                } else {
+                    Matrix3.clone(Matrix3.IDENTITY, instanceRotation);
+                }
+            }
+            if (hasCustomOrientation) {
+                Cartesian3.cross(instanceNormalRight, instanceNormalUp, instanceNormalForward);
+                Cartesian3.normalize(instanceNormalForward, instanceNormalForward);
+                Matrix3.setColumn(instanceRotation, 0, instanceNormalRight, instanceRotation);
+                Matrix3.setColumn(instanceRotation, 1, instanceNormalUp, instanceRotation);
+                Matrix3.setColumn(instanceRotation, 2, instanceNormalForward, instanceRotation);
+            }
+            Quaternion.fromRotationMatrix(instanceRotation, instanceQuaternion);
+            instanceTranslationRotationScale.rotation = instanceQuaternion;
 
-            // Get batch id. If there is no batch table, the batch id is the array index.
-            var batchId = i;
-            if (hasBatchTable) {
-                batchId = instancesView.getUint16(byteOffset, true);
-                byteOffset += sizeOfUint16;
+            // Get the instance scale
+            instanceScale.x = 1.0;
+            instanceScale.y = 1.0;
+            instanceScale.z = 1.0;
+            var scale = featureTable.getProperty('SCALE', i, ComponentDatatype.FLOAT);
+            if (defined(scale)) {
+                Cartesian3.multiplyByScalar(instanceScale, scale, instanceScale);
+            }
+            var nonUniformScale = featureTable.getProperty('SCALE_NON_UNIFORM', i, ComponentDatatype.FLOAT, 3);
+            if (defined(nonUniformScale)) {
+                instanceScale.x *= nonUniformScale[0];
+                instanceScale.y *= nonUniformScale[1];
+                instanceScale.z *= nonUniformScale[2];
+            }
+            instanceTranslationRotationScale.scale = instanceScale;
+
+            // Get the batchId
+            var batchId;
+            if (defined(featureTable.json.BATCH_ID)) {
+                var componentType = defaultValue(featureTable.json.BATCH_ID.componentType, ComponentDatatype.UNSIGNED_SHORT);
+                batchId = featureTable.getProperty('BATCH_ID', i, componentType);
+            } else {
+                // If BATCH_ID semantic is undefined, batchId is just the instance number
+                batchId = i;
             }
 
-            Cartesian3.fromRadians(longitude, latitude, height, ellipsoid, position);
-            var modelMatrix = Transforms.eastNorthUpToFixedFrame(position);
-
+            // Create the model matrix and the instance
+            Matrix4.fromTranslationRotationScale(instanceTranslationRotationScale, instanceTransform);
+            var modelMatrix = instanceTransform.clone();
             instances[i] = {
                 modelMatrix : modelMatrix,
                 batchId : batchId
@@ -284,16 +455,16 @@ define([
         var modelInstanceCollection = new ModelInstanceCollection(collectionOptions);
         this._modelInstanceCollection = modelInstanceCollection;
         this.state = Cesium3DTileContentState.PROCESSING;
-        this.contentReadyToProcessPromise.resolve(this);
+        this._contentReadyToProcessPromise.resolve(this);
 
         var that = this;
 
-        when(modelInstanceCollection.readyPromise).then(function(modelInstanceCollection) {
+        modelInstanceCollection.readyPromise.then(function(modelInstanceCollection) {
             that.state = Cesium3DTileContentState.READY;
-            that.readyPromise.resolve(that);
+            that._readyPromise.resolve(that);
         }).otherwise(function(error) {
             that.state = Cesium3DTileContentState.FAILED;
-            that.readyPromise.reject(error);
+            that._readyPromise.reject(error);
         });
     };
 
@@ -302,7 +473,14 @@ define([
      */
     Instanced3DModel3DTileContent.prototype.applyDebugSettings = function(enabled, color) {
         color = enabled ? color : Color.WHITE;
-        this.batchTableResources.setAllColor(color);
+        this.batchTable.setAllColor(color);
+    };
+
+    /**
+     * Part of the {@link Cesium3DTileContent} interface.
+     */
+    Instanced3DModel3DTileContent.prototype.applyStyleWithShader = function(frameState, style) {
+        return false;
     };
 
     /**
@@ -311,13 +489,16 @@ define([
     Instanced3DModel3DTileContent.prototype.update = function(tileset, frameState) {
         var oldAddCommand = frameState.addCommand;
         if (frameState.passes.render) {
-            frameState.addCommand = this.batchTableResources.getAddCommand();
+            frameState.addCommand = this.batchTable.getAddCommand();
         }
 
         // In the PROCESSING state we may be calling update() to move forward
         // the content's resource loading.  In the READY state, it will
         // actually generate commands.
-        this.batchTableResources.update(tileset, frameState);
+        this.batchTable.update(tileset, frameState);
+        this._modelInstanceCollection.modelMatrix = this._tile.computedTransform;
+        this._modelInstanceCollection.shadows = this._tileset.shadows;
+        this._modelInstanceCollection.debugWireframe = this._tileset.debugWireframe;
         this._modelInstanceCollection.update(frameState);
 
         frameState.addCommand = oldAddCommand;
@@ -325,7 +506,7 @@ define([
 
     function destroyResources(content) {
         content._modelInstanceCollection = content._modelInstanceCollection && content._modelInstanceCollection.destroy();
-        content.batchTableResources = content.batchTableResources && content.batchTableResources.destroy();
+        content.batchTable = content.batchTable && content.batchTable.destroy();
     }
 
     /**
