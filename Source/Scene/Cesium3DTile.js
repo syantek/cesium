@@ -289,7 +289,7 @@ define([
         }
 
         /**
-         * The time in seconds after the tile's content is downloaded when the content expires and new content is requested.
+         * The time in seconds after the tile's content is ready when the content expires and new content is requested.
          *
          * @type {Number}
          */
@@ -482,12 +482,49 @@ define([
         }
     });
 
+    var scratchJulianDate = new JulianDate();
+
+    /**
+     * Check if the tile's content has expired.
+     *
+     * @private
+     */
+    Cesium3DTile.prototype.isContentExpired = function() {
+        if (this._content.state === Cesium3DTileContentState.EXPIRED) {
+            return true;
+        }
+        if (defined(this.expireDate) && this.contentReady && (this.hasContent || this.hasTilesetContent)) {
+            var now = JulianDate.now(scratchJulianDate);
+            if (JulianDate.lessThan(this.expireDate, now)) {
+                this._content.state = Cesium3DTileContentState.EXPIRED;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    function updateExpireDate(tile) {
+        if (defined(tile.expireDuration)) {
+            var expireDurationDate = JulianDate.now(scratchJulianDate);
+            JulianDate.addSeconds(expireDurationDate, tile.expireDuration, expireDurationDate);
+
+            if (defined(tile.expireDate)) {
+                if (JulianDate.lessThan(tile.expireDate, expireDurationDate)) {
+                    JulianDate.clone(expireDurationDate, tile.expireDate);
+                }
+            } else {
+                tile.expireDate = JulianDate.clone(expireDurationDate);
+            }
+        }
+    }
+
     function addContentReadyPromise(tile) {
         // Content enters the READY state
-        tile._content.readyPromise.then(function(content) {
+        tile._content.readyPromise.then(function() {
             if (defined(tile.parent)) {
                 --tile.parent.numberOfChildrenWithoutContent;
             }
+            updateExpireDate(tile);
         }).otherwise(function(error) {
             // In this case, that.parent.numberOfChildrenWithoutContent will never reach zero
             // and therefore that.parent will never refine.  If this becomes an issue, failed
@@ -531,9 +568,17 @@ define([
      *
      * @private
      */
-    Cesium3DTile.prototype.unloadContent = function() {
+    Cesium3DTile.prototype.unloadContent = function(makeEmpty) {
         if (defined(this.parent)) {
             ++this.parent.numberOfChildrenWithoutContent;
+        }
+
+        if (makeEmpty) {
+            this.hasContent = false;
+            this.hasTilesetContent = false;
+            this._createContent = function() {
+                return new Empty3DTileContent();
+            };
         }
 
         this._content = this._content && this._content.destroy();
@@ -555,16 +600,6 @@ define([
         this._debugContentBoundingVolume = this._debugContentBoundingVolume && this._debugContentBoundingVolume.destroy();
         this._debugViewerRequestVolume = this._debugViewerRequestVolume && this._debugViewerRequestVolume.destroy();
     };
-
-    Cesium3DTile.prototype.unloadContentAndMakeEmpty = function() {
-        this.hasContent = false;
-        this.hasTilesetContent = false;
-        this._createContent = function() {
-            return new Empty3DTileContent();
-        };
-        this.unloadContent();
-    };
-
 
     var scratchProjectedBoundingSphere = new BoundingSphere();
 

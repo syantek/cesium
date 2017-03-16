@@ -136,8 +136,8 @@ define([
         this.batchTable = undefined;
         this.featurePropertiesDirty = false;
 
-        this._contentReadyToProcessPromise = when.defer();
-        this._readyPromise = when.defer();
+        this._contentReadyToProcessPromise = undefined;
+        this._readyPromise = undefined;
         this._features = undefined;
         this._pointsLength = 0;
         this._vertexMemorySizeInBytes = 0;
@@ -291,6 +291,9 @@ define([
         if (!defined(promise)) {
             return false;
         }
+
+        this._contentReadyToProcessPromise = when.defer();
+        this._readyPromise = when.defer();
 
         this.state = Cesium3DTileContentState.LOADING;
         promise.then(function(arrayBuffer) {
@@ -1288,7 +1291,7 @@ define([
             command.shaderProgram = command.shaderProgram && command.shaderProgram.destroy();
             pickCommand.shaderProgram = pickCommand.shaderProgram && pickCommand.shaderProgram.destroy();
         }
-        content._drawComamnd = undefined;
+        content._drawCommand = undefined;
         content._pickCommand = undefined;
         content.batchTable = content.batchTable && content.batchTable.destroy();
     }

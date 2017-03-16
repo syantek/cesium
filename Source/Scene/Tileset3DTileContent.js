@@ -35,8 +35,8 @@ define([
         this.batchTable = undefined;
         this.featurePropertiesDirty = false;
 
-        this._contentReadyToProcessPromise = when.defer();
-        this._readyPromise = when.defer();
+        this._contentReadyToProcessPromise = undefined;
+        this._readyPromise = undefined;
     }
 
     defineProperties(Tileset3DTileContent.prototype, {
@@ -134,6 +134,8 @@ define([
      */
     Tileset3DTileContent.prototype.request = function() {
         var that = this;
+        this._contentReadyToProcessPromise = when.defer();
+        this._readyPromise = when.defer();
 
         this.state = Cesium3DTileContentState.LOADING;
         this._tileset.loadTileset(this._url, this._tile).then(function() {

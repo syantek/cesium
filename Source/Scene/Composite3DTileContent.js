@@ -50,8 +50,8 @@ define([
         this.state = Cesium3DTileContentState.UNLOADED;
         this.batchTable = undefined;
 
-        this._contentReadyToProcessPromise = when.defer();
-        this._readyPromise = when.defer();
+        this._contentReadyToProcessPromise = undefined;
+        this._readyPromise = undefined;
     }
 
     defineProperties(Composite3DTileContent.prototype, {
@@ -191,6 +191,9 @@ define([
         if (!defined(promise)) {
             return false;
         }
+
+        this._contentReadyToProcessPromise = when.defer();
+        this._readyPromise = when.defer();
 
         this.state = Cesium3DTileContentState.LOADING;
         promise.then(function(arrayBuffer) {

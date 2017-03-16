@@ -434,7 +434,7 @@ define([
         this.allTilesLoaded = new Event();
 
         /**
-         * The event fired to indicate that a tile's content was unloaded from the cache.
+         * The event fired to indicate that a tile's content was unloaded.
          * <p>
          * The unloaded {@link Cesium3DTile} is passed to the event listener.
          * </p>
@@ -924,11 +924,6 @@ define([
             // If there is a parentTile, add the root of the currently loading tileset
             // to parentTile's children, and increment its numberOfChildrenWithoutContent
             if (defined(parentTile)) {
-                if (parentTile.children.length > 0) {
-                    // Unload the old subtree if it exists
-                    unloadExpiredSubtree(parentTile);
-                }
-
                 parentTile.children.push(rootTile);
                 ++parentTile.numberOfChildrenWithoutContent;
 
@@ -1012,13 +1007,6 @@ define([
                     }
                 }
             }
-        }
-    }
-
-    function recheckRefinement(tile) {
-        var ancestor = getAncestorWithContent(tile);
-        if (defined(ancestor) && (ancestor.refine === Cesium3DTileRefine.REPLACE)) {
-            prepareRefiningTiles([ancestor]);
         }
     }
 
@@ -1161,71 +1149,23 @@ define([
 
     ///////////////////////////////////////////////////////////////////////////
 
-    var scratchJulianDate = new JulianDate();
-
-    function updateExpireDate(tile) {
-        if (defined(tile.expireDuration)) {
-            var expireDurationDate = JulianDate.now(scratchJulianDate);
-            JulianDate.addSeconds(expireDurationDate, tile.expireDuration, expireDurationDate);
-
-            if (defined(tile.expireDate)) {
-                if (JulianDate.lessThan(expireDurationDate, tile.expireDate)) {
-                    JulianDate.clone(expireDurationDate, tile.expireDate);
-                }
-            } else {
-                tile.expireDate = JulianDate.clone(expireDurationDate);
-            }
-        }
-    }
-
-    function unloadExpiredSubtree(tile) {
+    function unloadSubtree(tileset, tile) {
+        var stats = tileset._statistics;
         var stack = [];
         stack.push(tile);
         while (stack.length > 0) {
             tile = stack.pop();
+            unloadTile(tileset, tile, false);
             var children = tile.children;
             var length = children.length;
             for (var i = 0; i < length; ++i) {
                 var child = children[i];
-                child.destroy();
+                --stats.numberTotal;
                 stack.push(child);
             }
         }
+
         tile.children = [];
-        tile.unloadContent();
-    }
-
-    function unloadExpiredLeafTile(tile) {
-        tile.destroy();
-        var parent = tile.parent;
-        if (defined(parent)) {
-            var index = parent.children.indexOf(tile);
-            parent.children.splice(index, 1);
-            recheckRefinement(parent);
-        }
-    }
-
-    function unloadExpiredTile(tile) {
-        if (tile.children.length === 0) {
-            unloadExpiredLeafTile(tile);
-            return;
-        }
-
-        if (tile.hasContent) {
-            // When the tile is expired and the request fails, there is no longer any content to show.
-            // Unload the tile's old content and replace it with Empty3DTileContent.
-            tile.unloadContentAndMakeEmpty();
-            // Now that the tile is empty recheck its parent's refinement
-            recheckRefinement(tile.parent);
-        } else if (tile.hasTilesetContent) {
-            // When the tile is the root of an external tileset, unload the entire subtree
-            unloadExpiredSubtree(tile);
-            // Also destroy this tile
-            unloadExpiredLeafTile(tile);
-        }
-    }
-    function isVisible(visibilityPlaneMask) {
-        return visibilityPlaneMask !== CullingVolume.MASK_OUTSIDE;
     }
 
     function requestContent(tileset, tile, outOfCore) {
@@ -1236,7 +1176,7 @@ define([
             return;
         }
 
-        var expired = (tile.content.state === Cesium3DTileContentState.EXPIRED);
+        var expired = tile.isContentExpired();
 
         tile.requestContent();
 
@@ -1247,23 +1187,26 @@ define([
         if (tile.content.state === Cesium3DTileContentState.LOADING) {
             ++stats.numberOfPendingRequests;
 
-            var removeFunction = removeFromProcessingQueue(tileset, tile);
-            when(tile.content.contentReadyToProcessPromise).then(function() {
-                // Content is loaded and ready to process
-                addToProcessingQueue(tileset, tile);
-                updateExpireDate(tile);
-            }).otherwise(removeFunction);
+            if (expired && tile.hasTilesetContent) {
+                unloadSubtree(tileset, tile);
+            }
 
-            when(tile.content.readyPromise).then(removeFunction).otherwise(function() {
-                // The request failed
+            var removeFunction = removeFromProcessingQueue(tileset, tile);
+            tile.content.contentReadyToProcessPromise.then(addToProcessingQueue(tileset, tile));
+            tile.content.readyPromise.then(removeFunction).otherwise(function() {
                 removeFunction();
                 if (expired) {
-                    unloadExpiredTile(tile);
+                    // Failed to request new content for the expired tile, so unload it and make it empty
+                    unloadTile(tileset, tile, true);
                 }
             });
         } else {
             ++stats.numberOfAttemptedRequests;
         }
+    }
+
+    function isVisible(visibilityPlaneMask) {
+        return visibilityPlaneMask !== CullingVolume.MASK_OUTSIDE;
     }
 
     function selectTile(tileset, tile, fullyVisible, frameState) {
@@ -1386,6 +1329,10 @@ define([
             t.replaced = false;
             ++stats.visited;
 
+            if (t.isContentExpired()) {
+                requestContent(tileset, t, outOfCore);
+            }
+
             var visibilityPlaneMask = t.visibilityPlaneMask;
             var fullyVisible = (visibilityPlaneMask === CullingVolume.MASK_INSIDE);
 
@@ -1394,18 +1341,6 @@ define([
             // Tile is inside/intersects the view frustum.  How many pixels is its geometric error?
             var sse = getScreenSpaceError(tileset, t.geometricError, t, frameState);
             // PERFORMANCE_IDEA: refine also based on (1) occlusion/VMSSE and/or (2) center of viewport
-
-            // If the tile is expired, request new content
-            if (defined(t.expireDate)) {
-                var now = JulianDate.now(scratchJulianDate);
-                if (JulianDate.lessThan(now, t.expireDate)) {
-                    // Request new content
-                    if (t.contentReady && (t.hasContent || t.hasTilesetContent)) {
-                        t.content.state = Cesium3DTileContentState.EXPIRED;
-                        requestContent(tileset, t, outOfCore);
-                    }
-                }
-            }
 
             var children = t.children;
             var childrenLength = children.length;
@@ -1698,10 +1633,12 @@ define([
     ///////////////////////////////////////////////////////////////////////////
 
     function addToProcessingQueue(tileset, tile) {
-        tileset._processingQueue.push(tile);
+        return function() {
+            tileset._processingQueue.push(tile);
 
-        --tileset._statistics.numberOfPendingRequests;
-        ++tileset._statistics.numberProcessing;
+            --tileset._statistics.numberOfPendingRequests;
+            ++tileset._statistics.numberProcessing;
+        };
     }
 
     function removeFromProcessingQueue(tileset, tile) {
@@ -1878,14 +1815,29 @@ define([
         }
     }
 
+    function unloadTile(tileset, tile, makeEmpty) {
+        if (tile.hasContent) {
+            var stats = tileset._statistics;
+            var replacementList = tileset._replacementList;
+            var tileUnload = tileset.tileUnload;
+
+            tileUnload.raiseEvent(tile);
+            replacementList.remove(tile.replacementNode);
+            decrementPointAndFeatureLoadCounts(tileset, tile.content);
+            --stats.numberContentReady;
+        }
+
+        if (tile.hasContent || (tile.hasTilesetContent && makeEmpty)) {
+            tile.unloadContent(makeEmpty);
+        }
+    }
+
     function unloadTiles(tileset, frameState) {
         var trimTiles = tileset._trimTiles;
         tileset._trimTiles = false;
 
-        var stats = tileset._statistics;
         var maximumNumberOfLoadedTiles = tileset._maximumNumberOfLoadedTiles + 1; // + 1 to account for sentinel
         var replacementList = tileset._replacementList;
-        var tileUnload = tileset.tileUnload;
 
         // Traverse the list only to the sentinel since tiles/nodes to the
         // right of the sentinel were used this frame.
@@ -1895,16 +1847,8 @@ define([
         var node = replacementList.head;
         while ((node !== sentinel) && ((replacementList.length > maximumNumberOfLoadedTiles) || trimTiles)) {
             var tile = node.item;
-
-            decrementPointAndFeatureLoadCounts(tileset, tile.content);
-            tileUnload.raiseEvent(tile);
-            tile.unloadContent();
-
-            var currentNode = node;
             node = node.next;
-            replacementList.remove(currentNode);
-
-            --stats.numberContentReady;
+            unloadTile(tileset, tile, false);
         }
     }
 
