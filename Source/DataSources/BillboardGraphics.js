@@ -89,6 +89,8 @@ define([
         this._sizeInMetersSubscription = undefined;
         this._distanceDisplayCondition = undefined;
         this._distanceDisplayConditionSubscription = undefined;
+        this._disableDepthTestDistance = undefined;
+        this._disableDepthTestDistanceSubscription = undefined;
         this._definitionChanged = new Event();
 
         this.merge(defaultValue(options, defaultValue.EMPTY_OBJECT));
@@ -316,7 +318,9 @@ define([
          * @memberof BillboardGraphics.prototype
          * @type {Property}
          */
-        distanceDisplayCondition : createPropertyDescriptor('distanceDisplayCondition')
+        distanceDisplayCondition : createPropertyDescriptor('distanceDisplayCondition'),
+
+        disableDepthTestDistance : createPropertyDescriptor('disableDepthTestDistance')
     });
 
     /**
@@ -348,6 +352,7 @@ define([
         result.pixelOffsetScaleByDistance = this._pixelOffsetScaleByDistance;
         result.sizeInMeters = this._sizeInMeters;
         result.distanceDisplayCondition = this._distanceDisplayCondition;
+        result.disableDepthTestDistance = this._disableDepthTestDistance;
         return result;
     };
 
@@ -383,6 +388,7 @@ define([
         this.pixelOffsetScaleByDistance = defaultValue(this._pixelOffsetScaleByDistance, source.pixelOffsetScaleByDistance);
         this.sizeInMeters = defaultValue(this._sizeInMeters, source.sizeInMeters);
         this.distanceDisplayCondition = defaultValue(this._distanceDisplayCondition, source.distanceDisplayCondition);
+        this.disableDepthTestDistance = defaultValue(this._disableDepthTestDistance, source.disableDepthTestDistance);
     };
 
     return BillboardGraphics;
